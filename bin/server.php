@@ -1,0 +1,162 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * 启动入口：
+ *   php bin/server.php [端口] [MOTD] [存档目录]
+ * 例：php bin/server.php 25565 "PHP 写的 1.8.9" world
+ *
+ * 存档目录不给就用项目下的 world/；目录里没有 level.dat 就按 Anvil 格式新建一份，
+ * 新建出来的是标准存档，可以直接用 Minecraft 单机打开。
+ */
+
+require __DIR__ . '/../src/Protocol.php';
+require __DIR__ . '/../src/WebSocket.php';
+require __DIR__ . '/../src/Nbt/Tag.php';
+require __DIR__ . '/../src/Nbt/Nbt.php';
+require __DIR__ . '/../src/World/Chunk.php';
+require __DIR__ . '/../src/World/LongMath.php';
+require __DIR__ . '/../src/World/JavaRandom.php';
+require __DIR__ . '/../src/World/NoiseGeneratorImproved.php';
+require __DIR__ . '/../src/World/NoiseGeneratorOctaves.php';
+require __DIR__ . '/../src/World/DensityField.php';
+require __DIR__ . '/../src/World/SurfaceRules.php';
+require __DIR__ . '/../src/World/CaveCarver.php';
+require __DIR__ . '/../src/World/CaveGenerator.php';
+require __DIR__ . '/../src/World/OreDecorator.php';
+require __DIR__ . '/../src/World/VillageGenerator.php';
+foreach (glob(__DIR__ . '/../src/World/Layer/*.php') as $__f) {
+    require $__f;
+}
+require __DIR__ . '/../src/World/TerrainGenerator.php';
+require __DIR__ . '/../src/World/NetherCaveGenerator.php';
+require __DIR__ . '/../src/World/NetherGenerator.php';
+require __DIR__ . '/../src/World/EndGenerator.php';
+require __DIR__ . '/../src/World/AnvilWorld.php';
+require __DIR__ . '/../src/World/ChestStore.php';
+require __DIR__ . '/../src/ChestTrait.php';
+require __DIR__ . '/../src/EnderChestTrait.php';
+require __DIR__ . '/../src/MobTrait.php';
+require __DIR__ . '/../src/FurnaceTrait.php';
+require __DIR__ . '/../src/SpawnerTrait.php';
+require __DIR__ . '/../src/BannerTrait.php';
+require __DIR__ . '/../src/BrewingTrait.php';
+require __DIR__ . '/../src/FarmingTrait.php';
+require __DIR__ . '/../src/EnchantTrait.php';
+require __DIR__ . '/../src/EntityStoreTrait.php';
+require __DIR__ . '/../src/ArrowTrait.php';
+require __DIR__ . '/../src/BlockPhysicsTrait.php';
+require __DIR__ . '/../src/AnvilTrait.php';
+require __DIR__ . '/../src/PortalTrait.php';
+require __DIR__ . '/../src/FluidTrait.php';
+require __DIR__ . '/../src/RedstoneTrait.php';
+require __DIR__ . '/../src/EndTrait.php';
+require __DIR__ . '/../src/RecipeTable.php';
+require __DIR__ . '/../src/ItemIds.php';
+require __DIR__ . '/../src/CraftingTrait.php';
+require __DIR__ . '/../src/Skin/Skins.php';
+require __DIR__ . '/../src/PluginManager.php';
+require __DIR__ . '/../src/Server.php';
+
+$port = 25565;
+if (isset($argv[1]) && $argv[1] !== '') {
+    $port = (int) $argv[1];
+} elseif (getenv('MC_PORT') !== false && getenv('MC_PORT') !== '') {
+    $port = (int) getenv('MC_PORT');
+}
+
+$motd = $argv[2] ?? 'PHP 写的 1.8.9 服务器';
+$worldDir = isset($argv[3]) && $argv[3] !== ''
+    ? $argv[3]
+    : (__DIR__ . '/../world');
+// 相对路径时相对项目根
+if ($worldDir[0] !== '/' && !preg_match('#^[A-Za-z]:[/\\\\]#', $worldDir)) {
+    $worldDir = __DIR__ . '/../' . $worldDir;
+}
+
+// 单实例守卫。
+// Windows 的 SO_REUSEADDR 允许多个进程绑同一端口，后起的那个不报错，
+// 于是「重启了但玩家连到的还是旧进程」——改的代码看起来完全没生效。
+// 这里先探一下端口，有人占着就直接退出，别制造第二个幽灵。
+$probe = @fsockopen('127.0.0.1', $port, $errno, $errstr, 0.3);
+if ($probe !== false) {
+    fclose($probe);
+    fwrite(STDERR, "端口 {$port} 已经被另一个进程占着了。\n");
+    fwrite(STDERR, "先把它关掉（netstat -ano | findstr :{$port} 看 PID），再来一遍。\n");
+    exit(1);
+}
+
+
+// ---- server.properties（命令行参数优先，没有才用配置文件）----
+$props = [];
+$propFile = __DIR__ . '/../server.properties';
+if (is_file($propFile)) {
+    foreach (file($propFile, FILE_IGNORE_NEW_LINES) as $__line) {
+        $__line = trim($__line);
+        if ($__line === '' || $__line[0] === '#' || strpos($__line, '=') === false) {
+            continue;
+        }
+        [$__k, $__v] = explode('=', $__line, 2);
+        $props[trim($__k)] = trim($__v);
+    }
+}
+// 只有命令行没给端口时才读配置
+if (!isset($argv[1]) || $argv[1] === '') {
+    if (isset($props['server-port'])) {
+        $port = (int) $props['server-port'];
+    }
+}
+if (!isset($argv[2]) || $argv[2] === '') {
+    if (isset($props['motd']) && $props['motd'] !== '') {
+        $motd = $props['motd'];
+    }
+}
+if ((!isset($argv[3]) || $argv[3] === '') && isset($props['level-name']) && $props['level-name'] !== '') {
+    $worldDir = __DIR__ . '/../' . $props['level-name'];
+}
+if (isset($props['view-distance'])) {
+    $viewDistance = max(2, min(16, (int) $props['view-distance']));
+}
+$maxPlayers = isset($props['max-players']) ? max(1, (int) $props['max-players']) : 20;
+
+// wss（网页客户端走 TLS 的入口）。没配 wss-port 就不开。
+// 证书默认用 certs/ 下那对自签的，换成正版证书改这两个键就行。
+$wssPort = isset($props['wss-port']) ? (int) $props['wss-port'] : 0;
+$wssCert = $props['wss-cert'] ?? (__DIR__ . '/../certs/server.crt');
+$wssKey = $props['wss-key'] ?? (__DIR__ . '/../certs/server.key');
+// 公网地址：进服广播里用。没配就用本机内网 IP。
+$publicHost = $props['public-address'] ?? '';
+
+$world = new PhpMc\World\AnvilWorld($worldDir);
+if (isset($props['gamemode'])) {
+    $gamemode = (int) $props['gamemode'];
+}
+
+// 皮肤白名单：游戏内名字 => 要查的正版名。离线号不要往里加，
+// 否则会查到同名的陌生人，把人家的皮肤贴到你头上。
+$allow = [];
+$skinConf = __DIR__ . '/../skins.conf.json';
+if (is_file($skinConf)) {
+    $json = json_decode((string) @file_get_contents($skinConf), true);
+    if (is_array($json)) {
+        foreach ($json as $k => $v) {
+            if (is_string($v) && $v !== '' && is_string($k) && ($k[0] ?? '') !== '_') {
+                $allow[strtolower($k)] = $v;
+            }
+        }
+    }
+}
+
+$skins = new PhpMc\Skin\Skins(__DIR__ . '/../cache/skins.json', $allow);
+$chests = new PhpMc\World\ChestStore(
+    __DIR__ . '/../cache/chests-' . substr(md5($worldDir), 0, 8) . '.json'
+);
+$world->attachChestStore($chests);
+$gamemode = $world->created ? 1 : $world->gameType();
+
+$server = new PhpMc\Server('0.0.0.0', $port, $motd, $world, $skins, $chests, $maxPlayers, $gamemode, $viewDistance ?? 3, $wssPort ?? 0, $wssCert, $wssKey, $publicHost ?? '');
+$world->addTileProvider([$server, 'furnaceTilesForChunk']);
+$world->addTileProvider([$server, 'spawnerTilesForChunk']);
+$world->addTileProvider([$server, 'bannerTilesForChunk']);
+$server->loadPlugins(__DIR__ . '/../plugins');
+$server->run();

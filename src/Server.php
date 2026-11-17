@@ -1,0 +1,6128 @@
+<?php
+declare(strict_types=1);
+
+namespace PhpMc;
+
+use PhpMc\Nbt\Nbt;
+use PhpMc\Nbt\Tag;
+use PhpMc\Skin\Skins;
+use PhpMc\World\AnvilWorld;
+
+/** 一条玩家的 TCP 连接。状态机：0 握手 → 1 状态查询 / 2 登录 → 3 游戏内。 */
+final class Connection
+{
+    public const STATE_HANDSHAKE = 0;
+    public const STATE_STATUS = 1;
+    public const STATE_LOGIN = 2;
+    public const STATE_PLAY = 3;
+
+    /** @var resource */
+    public $socket;
+    public string $in = '';
+    public string $out = '';
+    public int $state = self::STATE_HANDSHAKE;
+    public int $protocol = 0;
+    public string $remote = '';
+    public bool $closed = false;
+    /** WebSocket 状态：unknown=还没判 / ''=普通 TCP / handshake=收到 HTTP 头 / open=已握手 */
+    public string $ws = '';
+    /** WS 解帧缓冲区（半个帧会留在这里等下一拍） */
+    public string $wsBuf = '';
+    /** 这条连接是不是从 wss 端口进来的 */
+    public bool $tls = false;
+    /** TLS 握手是否已完成 */
+    public bool $tlsReady = true;
+    public float $lastRead = 0.0;
+
+    // 登录后
+    public int $entityId = 0;
+    public string $username = '';
+    public string $uuid = '';
+    /** @var array{value:string,signature:string}|null */
+    public ?array $textures = null;
+    /** @var array{x:int,y:int,z:int,size:int,partner:?array{0:int,1:int,2:int},slots:array}|null 打开着的箱子 */
+    public ?array $chest = null;
+
+    /** @var array{id:int,count:int,damage:int}|null 服务端记录的光标物品 */
+    public ?array $cursor = null;
+    /** @var array<string, array{0:int,1:int,2:int}> 进服时带箱子的区块段，稍后重发一次 */
+    public array $chestSections = [];
+    /** 段重发时间点（秒） */
+    public array $chestSectionTimes = [];
+    /** 箱子补发跑到第几轮了（0 起）：第一轮只造 TE，之后才发 0x23 */
+    public int $chestFixRound = 0;
+    /** 是否已经提示过「书架其实是箱子」 */
+    public bool $chestHinted = false;
+    /** 当前打开的熔炉坐标 */
+    public ?array $furnace = null;
+
+    /** 正在睡的床坐标 [x,y,z] */
+    public ?array $sleepBed = null;
+    /** 睡过的床 -> 死亡重生点 [x,y,z]（原版 SpawnChunk 机制） */
+    public ?array $bedSpawn = null;
+
+    /** 正在打开的酿造台 ['x','y','z','cursor'] */
+    public ?array $brewing = null;
+
+    /** 正在打开的附魔台 ['x','y','z'] */
+    public ?array $enchantTable = null;
+
+    /** 附魔看门狗：进服时哪些槽有附魔，之后丢了就报 */
+    public array $enchWatch = [];
+
+    /** 最近收到的包 id（定位附魔丢失时看上下文） */
+    public array $pktLog = [];
+
+    /** 铁砧窗口：x/y/z + 两个输入槽 */
+    public ?array $anvil = null;
+
+    /** 正在乘坐的载具 eid（0 = 没坐） */
+    public int $riding = 0;
+
+    /** 上次重发挂载包的时刻 */
+    public float $rideSyncAt = 0.0;
+
+    /** 站在传送门里的起始时刻（0 = 没在门里） */
+    public float $portalSince = 0.0;
+    /** 当前客户端维度（0 主世界 / -1 地狱），回程要切回来 */
+    public int $portalDim = 0;
+    /** 上次切维度的时刻，用来给传送门判定加冷却（不然会在门里来回弹） */
+    public float $portalDimAt = 0.0;
+    /** 维度包补发时刻（>0 表示待补发） */
+    public float $portalResyncAt = 0.0;
+    /** 进传送门前的位置，回来时用 */
+    public ?array $portalReturn = null;
+
+    /** 上次火焰伤害结算时刻 */
+    public float $lastFireTick = 0.0;
+
+    /** 上次移动的时刻（用来判断玩家是不是站着不动） */
+    public float $lastMoveAt = 0.0;
+
+    /** 经验：等级 / 当前级进度(0~1) / 总经验 */
+    public int $xpLevel = 0;
+    public float $xpProgress = 0.0;
+    public int $xpTotal = 0;
+
+    /** 末影箱重试 [时刻, x, y, z] */
+    public array $enderRetries = [];
+    /** @var array<int,array{id:int,count:int,damage:int}|null> 玩家 2x2 合成格 */
+    public array $craftGrid = [null, null, null, null];
+    /** @var array<int,array{id:int,count:int,damage:int}|null> 工作台 3x3 合成格 */
+    public array $craft9 = [null, null, null, null, null, null, null, null, null];
+    /** 是否打开了工作台窗口（windowId 2） */
+    public bool $workbench = false;
+    /** 拖动（mode 5）阶段：0 未开始，1 收集槽位，2 结束分发 */
+    public int $dragPhase = 0;
+    /** 拖动鼠标键：0 左，1 右，2 中 */
+    public int $dragButton = 0;
+    /** @var array<int,int> 拖动经过的容器槽位 */
+    public array $dragSlots = [];
+    /** 进服 1 秒后补发一次背包：有的客户端会忽略第一次 Window Items */
+    public float $resendInvAt = 0.0;
+    /** 进服 1 秒后重发一遍其他玩家的 Tab + Spawn（等客户端把 Tab 处理完） */
+    public float $resendPeersAt = 0.0;
+    /** 进服 1 秒后广播「我来了」给其他人（等他们把 Tab 处理完再收 Spawn） */
+    public float $announceAt = 0.0;
+    /** 创造模式第一次挖方块时提示一次「不掉落」，别每次都刷 */
+    public bool $hintedCreativeDrop = false;
+    /** 上次自然回血的时间 */
+    public float $lastRegen = 0.0;
+    /** 疲劳值：攒够 4.0 掉 1 点饱食度 */
+    public float $exhaustion = 0.0;
+    /** 下一次能吃的时间：一口 1.6 秒（原版进食时长） */
+    public float $nextEatAt = 0.0;
+    /** 上一次的位置，用来算跑动距离 */
+    public float $lastX = 0.0;
+    public float $lastY = 0.0;
+    public float $lastZ = 0.0;
+    public int $gamemode = 1;
+    public bool $flying = false;
+    /** 手上拿的是快捷栏第几格（0-8），客户端切物品时会告诉我们 */
+    public int $heldSlot = 0;
+    public float $health = 20.0;
+    public int $food = 20;
+    /** 上一次同步给客户端的血量/饱食度/是否饥饿，用于「只在变化时发包」 */
+    public float $lastHealth = -1.0;
+    public int $lastFood = -1;
+    public bool $wasHungry = false;
+    /** 饱和度：吃东西先加这个，消耗时先扣它（原版机制） */
+    public float $saturation = 5.0;
+    /** 原版 foodTimer：每 tick +1，满 80 触发一次回血/饿伤；条件不满足要清零 */
+    public int $foodTimer = 0;
+    /** 原版 prevFoodLevel：上一 tick 的饱食度 */
+    public int $prevFoodLevel = 20;
+    /** 距离上一次 FoodStats.onUpdate 的时间（用它把主循环降到 20 TPS） */
+    public float $lastFoodTick = 0.0;
+    /** 正在吃的物品 id（0 = 没在吃） */
+    public int $eatingItem = 0;
+    /** 吃完的时刻 */
+    public float $eatAt = 0.0;
+    /** 开始下落时的高度，落地时用来算摔伤 */
+    public float $fallFrom = -1.0;   // <0 表示没在下落
+    /** @var array<string, bool> 已经发过区块的 "cx,cz" */
+    public array $sentChunks = [];
+    /** @var array<string, array{0:int,1:int}> 等着补发的区块 */
+    public array $chunkQueue = [];
+    /** @var array<int, array{id:int,count:int,damage:int}> 槽位 => 物品 */
+    public array $inventory = [];
+
+    // 位置（脚底）
+    public float $x = 0.5;
+    public float $y = 4.0;
+    public float $z = 0.5;
+    public float $yaw = 0.0;
+    public float $pitch = 0.0;
+    public bool $onGround = true;
+
+    // Keep Alive
+    public int $keepAliveId = 0;
+    public float $keepAliveSentAt = 0.0;
+
+    public function __construct($socket, string $remote)
+    {
+        $this->socket = $socket;
+        $this->remote = $remote;
+        $this->lastRead = microtime(true);
+    }
+
+    public function send(int $packetId, Writer $payload): void
+    {
+        $data = Frame::encode(VarInt::encode($packetId) . $payload->toString());
+        // 网页客户端要包成 WebSocket binary 帧；普通 TCP 直接写
+        $this->out .= $this->ws === 'open' ? WebSocket::frame($data) : $data;
+    }
+
+    public function flush(): bool
+    {
+        if ($this->out === '') {
+            return true;
+        }
+        $written = @fwrite($this->socket, $this->out);
+        if ($written === false) {
+            return false;
+        }
+        if ($written > 0) {
+            $this->out = substr($this->out, $written);
+        }
+
+        return true;
+    }
+}
+
+final class Server
+{
+    use ChestTrait;
+    use EnderChestTrait;
+    use CraftingTrait;
+    use MobTrait;
+    use FurnaceTrait;
+    use SpawnerTrait;
+    use BannerTrait;
+    use BrewingTrait;
+    use FarmingTrait;
+    use EnchantTrait;
+    use EntityStoreTrait;
+    use ArrowTrait;
+    use BlockPhysicsTrait;
+    use AnvilTrait;
+    use PortalTrait;
+    use FluidTrait;
+    use RedstoneTrait;
+    use EndTrait;
+
+    public const PROTOCOL = 47;
+
+    /** 段重发开关：先关着（见 flushSections 的注释） */
+    private const ENABLE_SECTION_RESEND = false;
+    public const VERSION = '1.8.9';
+
+    // 客户端包 ID
+    private const C_KEEP_ALIVE = 0x00;
+    private const C_JOIN_GAME = 0x01;
+    private const C_CHAT = 0x02;
+    private const C_SPAWN_POSITION = 0x05;
+    private const C_POS_LOOK = 0x08;
+    private const C_SPAWN_PLAYER = 0x0C;
+    private const C_DESTROY_ENTITIES = 0x13;
+    private const C_SPAWN_MOB = 0x0F;
+    /** S->C Spawn Painting：eid + 标题 + 坐标 + 朝向 */
+    private const C_SPAWN_PAINTING = 0x29;   // gs 在客户端的注册顺序是第 42 个 → 41 = 0x29
+    private const C_TIME_UPDATE = 0x03;
+    private const C_ENTITY_STATUS = 0x1A;
+    /** S->C Explosion：xyz(float×3) + 半径 + 记录数(int) + 记录 + 玩家速度(float×3) */
+    private const C_EXPLOSION = 0x27;
+    /** S->C Sound Effect：音效名 + xyz(int，坐标×8) + 音量 + 音调 */
+    private const C_SOUND_EFFECT = 0x29;
+    /** S->C Spawn Experience Orb：eid + x/y/z(*32) + 经验值(short) */
+    private const C_SPAWN_XP_ORB = 0x11;
+    /** S->C Attach Entity：乘坐的实体 id + 载具 id（-1 = 下来）+ 拴绳字节 */
+    private const C_ATTACH_ENTITY = 0x1B;
+    private const C_ENTITY_MOVE = 0x15;
+    /** S->C Set Experience：进度(float) + 等级(varint) + 总经验(varint) */
+    private const C_SET_EXPERIENCE = 0x1F;      // 相对移动（客户端插值，看着顺）
+    private const C_ENTITY_LOOK = 0x16;
+    private const C_ENTITY_TELEPORT = 0x18;
+    private const C_HEAD_LOOK = 0x19;
+    private const C_CHUNK_DATA = 0x21;
+    /** 1.8 的瓦片实体包：箱子这类方块没有它客户端就不画 */
+    /** 窗口进度条：熔炉的余火/烧炼进度靠它同步 */
+    /** S->C SignEditorOpen：只带坐标，客户端收到就弹输入框 */
+    private const C_SIGN_EDITOR = 0x36;
+    private const C_WINDOW_PROPERTY = 0x31;
+    private const C_UPDATE_SIGN = 0x33;   // S->C Update Sign
+    private const C_UPDATE_TILE_ENTITY = 0x35;
+    // 1.8：0x0B 是 Animation（挥手），0x0D 才是 Collect Item。
+    // 写成 0x0B 的话客户端只会挥一下手，地上的东西永远不消失。
+    private const C_ANIMATION = 0x0B;
+    /** S->C Respawn：切维度（int 维度 / byte 难度 / byte 模式 / string 世界类型） */
+    private const C_RESPAWN = 0x07;
+
+    /** S->C Use Bed：让客户端躺下；传 (-1,-1,-1) 是叫它起来 */
+    private const C_USE_BED = 0x0A;
+    private const C_COLLECT_ITEM = 0x0D;
+    private const C_SPAWN_OBJECT = 0x0E;
+    private const C_ENTITY_VELOCITY = 0x12;
+    private const C_ENTITY_METADATA = 0x1C;
+    private const C_UPDATE_HEALTH = 0x06;
+    private const C_OPEN_WINDOW = 0x2D;
+    private const C_WINDOW_ITEMS = 0x30;
+    private const C_CONFIRM_TRANSACTION = 0x32;
+    private const C_BLOCK_CHANGE = 0x23;
+    private const C_CHANGE_GAME_STATE = 0x2B;
+    private const C_SET_SLOT = 0x2F;
+    private const C_PLAYER_LIST = 0x38;
+    private const C_ABILITIES = 0x39;
+    private const C_DISCONNECT = 0x40;
+
+    /** 插件系统：plugins/ 下的文件在启动时载入 */
+    private PluginManager $plugins;
+
+    /** @var array<int, Connection> */
+    private array $conns = [];
+
+    private int $nextEntityId = 1;
+
+    /** @var array<int,float> entityId => 该醒来的时间戳（睡觉用） */
+    private array $sleeping = [];
+
+    /** @var array 待恢复的床 [时刻, x, y, z, 真实 state] */
+    private array $pendingBedRestore = [];
+
+    /** @var array 我们生成的实体 eid => [type,x,y,z]（展示框/盔甲架/画） */
+    private array $spawnedEntities = [];
+
+    /** @var array 画 [x,y,z,title,dir,yaw] */
+    private array $paintings = [];
+
+    /** @var array 盔甲架 eid => [x,y,z] */
+    private array $armorStands = [];
+
+    /** 上次重发实体的时刻 */
+    private float $lastEntityResend = 0.0;
+    /** @var array<int, array{id:int,count:int,meta:int,x:float,y:float,z:float,at:float,expire:float}> */
+    private array $drops = [];
+    /** @var array<string, array{0:int,1:int,2:int}> 改了方块的 section，要重发给客户端 */
+    private array $dirtySections = [];
+    /** @var array<string, float> 上次补发段的时间，用来做节流 */
+    private array $lastSectionPush = [];
+    private float $startedAt;
+    private float $lastKeepAlive = 0.0;
+    private float $lastSave = 0.0;
+
+    public function __construct(
+        private string $host,
+        private int $port,
+        private string $motd,
+        private AnvilWorld $world,
+        private Skins $skins,
+        private \PhpMc\World\ChestStore $chests,
+        private int $maxPlayers = 20,
+        private int $gamemode = 1,
+        private int $viewDistance = 3,
+        private int $wssPort = 0,
+        private string $wssCert = '',
+        private string $wssKey = '',
+        private string $publicHost = '',
+    ) {
+        $this->startedAt = microtime(true);
+        $this->lastKeepAlive = microtime(true);
+        $this->lastSave = microtime(true);
+        $this->plugins = new PluginManager();
+    }
+
+    /**
+     * 预生成出生点周围的区块并写盘。
+     *
+     * 原版新世界时也是先卡在这里生成一片，再放人进来。
+     * 第二次启动时这些区块已存盘，读回来很快。
+     */
+    private function preGenerateSpawn(): void
+    {
+        [$sx, , $sz] = $this->world->spawnPoint();
+        $cx0 = $sx >> 4;
+        $cz0 = $sz >> 4;
+        $radius = max(3, min(6, $this->viewDistance + 1));
+        $side = $radius * 2 + 1;
+        $total = $side * $side;
+
+        $this->log("预生成出生点周围 {$total} 个区块（半径 {$radius}）...");
+        $t0 = microtime(true);
+        $done = 0;
+
+        for ($cx = $cx0 - $radius; $cx <= $cx0 + $radius; $cx++) {
+            for ($cz = $cz0 - $radius; $cz <= $cz0 + $radius; $cz++) {
+                $this->world->chunk($cx, $cz);
+                $done++;
+                if ($done % 16 === 0 || $done === $total) {
+                    $el = microtime(true) - $t0;
+                    $this->log(sprintf('  预生成 %d/%d  %.1fs', $done, $total, $el));
+                }
+            }
+        }
+
+        $saved = $this->world->save();
+        $this->log(sprintf('预生成完成：%d 个区块，存盘 %d 个，用时 %.1f 秒',
+            $total, $saved, microtime(true) - $t0));
+    }
+
+    /** @var resource|null wss 监听句柄（没配 wss-port 就是 null） */
+    private $tlsMaster = null;
+
+    public function run(): void
+    {
+        // 先把出生点周围生成好，再开端口。
+        // 顺序很重要：端口一开客户端就会连进来，那时还没地形可发。
+        $this->preGenerateSpawn();
+
+        $ctx = stream_context_create([
+            'socket' => ['backlog' => 64, 'so_reuseaddr' => true],
+        ]);
+        $master = @stream_socket_server(
+            "tcp://{$this->host}:{$this->port}",
+            $errno,
+            $errstr,
+            STREAM_SERVER_BIND | STREAM_SERVER_LISTEN,
+            $ctx
+        );
+
+        if ($master === false) {
+            fwrite(STDERR, "监听 {$this->host}:{$this->port} 失败: [{$errno}] {$errstr}\n");
+            exit(1);
+        }
+        stream_set_blocking($master, false);
+
+        // ---- 可选的 wss 监听 ----
+        // 用 tcp:// + ssl context：TLS 握手不在 accept 里做，而是在 pump 里
+        // 非阻塞地推进，否则一个慢客户端能把整个主循环卡死。
+        if ($this->wssPort > 0 && is_file($this->wssCert) && is_file($this->wssKey)) {
+            $tlsCtx = stream_context_create([
+                'ssl' => [
+                    'local_cert' => $this->wssCert,
+                    'local_pk' => $this->wssKey,
+                    'allow_self_signed' => true,
+                    'verify_peer' => false,
+                    'verify_peer_name' => false,
+                ],
+            ]);
+            $tls = @stream_socket_server(
+                "tcp://{$this->host}:{$this->wssPort}",
+                $tlsErrno,
+                $tlsErrstr,
+                STREAM_SERVER_BIND | STREAM_SERVER_LISTEN,
+                $tlsCtx
+            );
+            if ($tls !== false) {
+                stream_set_blocking($tls, false);
+                $this->tlsMaster = $tls;
+                $this->log("wss 监听 {$this->host}:{$this->wssPort}（自签证书 " . basename($this->wssCert) . '）');
+            } else {
+                $this->log("wss 端口 {$this->wssPort} 监听失败: [{$tlsErrno}] {$tlsErrstr}");
+            }
+        }
+
+        $this->log('PHP MC 服务端已启动  ' . "{$this->host}:{$this->port}" . '  协议 ' . self::PROTOCOL);
+        $this->log("MOTD: {$this->motd}");
+        $this->log('存档: ' . ($this->world->created ? '新建' : '载入') . ' / 视距 '
+            . $this->viewDistance . ' / 模式 ' . self::gameModeName($this->gamemode));
+
+        while (true) {
+            $read = [$master];
+            if ($this->tlsMaster !== null) {
+                $read[] = $this->tlsMaster;
+            }
+            $write = [];
+            foreach ($this->conns as $c) {
+                if ($c->closed) {
+                    continue;
+                }
+                $read[] = $c->socket;
+                if ($c->out !== '') {
+                    $write[] = $c->socket;
+                }
+            }
+            $except = null;
+
+            $ready = @stream_select($read, $write, $except, 0, 20000);
+            if ($ready === false) {
+                $this->log('stream_select 出错，退出');
+                break;
+            }
+
+            if ($ready > 0) {
+                foreach ($read as $sock) {
+                    if ($sock === $master
+                        || ($this->tlsMaster !== null && $sock === $this->tlsMaster)) {
+                        $this->accept($sock);
+                        continue;
+                    }
+                    $c = $this->find($sock);
+                    if ($c !== null) {
+                        $this->pump($c);
+                    }
+                }
+                foreach ($write as $sock) {
+                    $c = $this->find($sock);
+                    if ($c !== null && !$c->flush()) {
+                        $this->drop($c, '写失败');
+                    }
+                }
+            }
+
+            $this->tick();
+        }
+    }
+
+    private function accept($master): void
+    {
+        $sock = @stream_socket_accept($master, 0, $peer);
+        if ($sock === false) {
+            return;
+        }
+        stream_set_blocking($sock, false);
+        stream_set_read_buffer($sock, 0);
+        stream_set_write_buffer($sock, 0);
+        $c = new Connection($sock, (string) $peer);
+        $c->ws = 'unknown';
+        $c->tls = ($this->tlsMaster !== null && $master === $this->tlsMaster);
+        $c->tlsReady = !$c->tls;
+        $this->conns[(int) $sock] = $c;
+        $this->log("+ 连接 {$peer}");
+    }
+
+    private function find($sock): ?Connection
+    {
+        return $this->conns[(int) $sock] ?? null;
+    }
+
+    private function pump(Connection $c): void
+    {
+        // wss 进来的连接，先把 TLS 握手推完才看得见明文。
+        // 非阻塞模式下 enable_crypto 返回 0 表示「还缺数据」，下一拍再来。
+        if (!$c->tlsReady) {
+            $r = @stream_socket_enable_crypto(
+                $c->socket,
+                true,
+                STREAM_CRYPTO_METHOD_TLS_SERVER
+            );
+            if ($r === true) {
+                $c->tlsReady = true;
+            } elseif ($r === 0) {
+                return;
+            } else {
+                $this->drop($c, 'TLS 握手失败');
+
+                return;
+            }
+        }
+
+        $chunk = @fread($c->socket, 65536);
+        if ($chunk === false || ($chunk === '' && feof($c->socket))) {
+            $this->drop($c, '对端关闭');
+            return;
+        }
+        if ($chunk === '') {
+            return;
+        }
+        $c->lastRead = microtime(true);
+
+        // ---- WebSocket：首包看是不是 HTTP Upgrade，之后所有数据都过一遍拆帧 ----
+        if ($c->ws === 'unknown') {
+            $c->ws = WebSocket::looksLikeHttp($chunk) ? 'handshake' : '';
+            $this->log($c->ws === '' ? "  {$c->remote} 普通 TCP" : "  {$c->remote} WebSocket");
+        }
+
+        if ($c->ws === 'handshake') {
+            $c->wsBuf .= $chunk;
+            $end = strpos($c->wsBuf, "\r\n\r\n");
+            if ($end === false) {
+                if (strlen($c->wsBuf) > 8192) {
+                    $this->drop($c, 'WS 握手头过长');
+                }
+
+                return;
+            }
+            $header = substr($c->wsBuf, 0, $end + 4);
+            $c->wsBuf = substr($c->wsBuf, $end + 4);
+            $resp = WebSocket::handshakeResponse($header);
+            if ($resp === null) {
+                $this->drop($c, 'WS 握手缺 Sec-WebSocket-Key');
+
+                return;
+            }
+            $c->out .= $resp;
+            $c->ws = 'open';
+            $this->log("  {$c->remote} WebSocket 已握手");
+            if ($c->wsBuf === '') {
+                return;
+            }
+            // 握手的同一个包后面可能已经跟着第一帧 MC 数据
+            $chunk = $c->wsBuf;
+            $c->wsBuf = '';
+        }
+
+        if ($c->ws === 'open') {
+            $c->wsBuf .= $chunk;
+            [$data, $pongs, $closed] = WebSocket::decode($c->wsBuf);
+            foreach ($pongs as $p) {
+                $c->out .= WebSocket::pong($p);
+            }
+            if ($closed) {
+                $this->drop($c, 'WS 关闭帧');
+
+                return;
+            }
+            if ($data === '') {
+                return;
+            }
+            $chunk = $data;
+        }
+
+        $c->in .= $chunk;
+        try {
+            foreach (Frame::drain($c->in) as [$id, $r]) {
+                $this->handle($c, $id, $r);
+                if ($c->closed) {
+                    return;
+                }
+            }
+        } catch (\Throwable $e) {
+            $this->drop($c, '协议错误: ' . $e->getMessage());
+        }
+    }
+
+    private function handle(Connection $c, int $id, Reader $r): void
+    {
+        switch ($c->state) {
+            case Connection::STATE_HANDSHAKE:
+                if ($id !== 0x00) {
+                    throw new \RuntimeException("握手包ID异常: {$id}");
+                }
+                $c->protocol = $r->readVarInt();
+                $host = $r->readString(255);
+                $port = $r->readUnsignedShort();
+                $next = $r->readVarInt();
+                $c->state = $next === 1 ? Connection::STATE_STATUS : Connection::STATE_LOGIN;
+                $this->log("  握手 proto={$c->protocol} host={$host}:{$port} next={$next}");
+
+                return;
+
+            case Connection::STATE_STATUS:
+                if ($id === 0x00) {
+                    $c->send(0x00, (new Writer())->string($this->statusJson()));
+                } elseif ($id === 0x01) {
+                    $c->send(0x01, (new Writer())->long($r->readLong()));
+                }
+
+                return;
+
+            case Connection::STATE_LOGIN:
+                if ($id === 0x00) {
+                    $c->username = $r->readString(16);
+                    if ($c->username === '') {
+                        throw new \RuntimeException('空用户名');
+                    }
+                    foreach ($this->players() as $other) {
+                        if (strcasecmp($other->username, $c->username) === 0) {
+                            $c->send(0x00, (new Writer())->string(json_encode([
+                                'text' => '同名玩家已在游戏中',
+                                'color' => 'red',
+                            ], JSON_UNESCAPED_UNICODE)));
+                            $c->flush();
+                            $this->drop($c, '重名');
+
+                            return;
+                        }
+                    }
+                    $this->log("  登录 user={$c->username}");
+                    $this->join($c);
+                }
+
+                return;
+
+            case Connection::STATE_PLAY:
+                $this->handlePlay($c, $id, $r);
+
+                return;
+        }
+    }
+
+    // ---------------- 进服流程 ----------------
+
+    private function join(Connection $c): void
+    {
+        $c->uuid = self::offlineUuid($c->username);
+        $c->entityId = $this->nextEntityId++;
+        $c->state = Connection::STATE_PLAY;
+        // 用上次的模式，没有记录才用世界默认（/gm 换过之后重进保持）
+        $c->gamemode = $this->world->playerGamemode($c->username) ?? $this->gamemode;
+
+        // 饱食度和血量也要接着上次（不然重进永远满血满饱食度）
+        $vitals = $this->world->vitals($c->username);
+        $c->food = $vitals['food'];
+        $c->health = $vitals['hp'];
+
+        // 皮肤：只有拿着带签名的 textures 属性，别人的客户端才认
+        $t0 = microtime(true);
+        $c->textures = $this->skins->of($c->username);
+        $ms = (microtime(true) - $t0) * 1000;
+        $this->log(sprintf(
+            '  皮肤 %s（%s，%.0f ms）',
+            $c->textures === null ? '未取到' : '已取到',
+            $c->username,
+            $ms
+        ));
+
+        [$sx, $sy, $sz] = $this->world->spawnPoint();
+        $c->x = $sx + 0.5;
+        $c->y = (float) $sy;
+        $c->z = $sz + 0.5;
+
+        // 上次在哪儿下线就回哪儿，别每次都把人扔回出生点
+        $last = $this->world->lastPosition($c->username);
+        if ($last !== null && $last['y'] > 0 && $last['y'] < 256) {
+            $c->x = $last['x'];
+            $c->y = $last['y'];
+            $c->z = $last['z'];
+            $c->yaw = $last['yaw'] ?? 0.0;
+            $c->pitch = $last['pitch'] ?? 0.0;
+            $this->log("  回到上次位置 {$c->x},{$c->y},{$c->z}");
+        }
+
+        // 1) Login Success
+        $c->send(0x02, (new Writer())->string($c->uuid)->string($c->username));
+
+        // 2) Join Game
+        $c->send(self::C_JOIN_GAME, (new Writer())
+            ->int($c->entityId)
+            ->unsignedByte($c->gamemode)
+            ->byte(0)                       // 维度：主世界
+            ->unsignedByte(0)               // 难度：和平
+            ->unsignedByte($this->maxPlayers)
+            ->string($this->world->generator())
+            ->bool(false));                 // reduced debug info
+
+        // 3) 能力：不发这个，创造模式等于没开（不能飞、不是无敌）
+        $this->sendAbilities($c);
+
+        // 血量：用上面读到的存档值，不再强制满血
+        $this->sendHealth($c);
+
+        // 上一次位置要先设成出生点，否则第一段移动会被算成「从 0,0,0 跑过来」，
+        // 一口气掉好几格饱食度。
+        $c->lastX = $c->x;
+        $c->lastY = $c->y;
+        $c->lastZ = $c->z;
+
+        // 实体持久化：第一次有人进服时把展示框/盔甲架/画读回来
+        $this->loadEntities();
+
+        // 背包：不发这个，重连之后东西就「没了」（客户端从空背包开始）
+        $c->inventory = $this->world->inventory($c->username);
+
+        // 清洗：旧版本存进去的「没有物品形态的 id」要丢掉，
+        // 否则每次进服发 Window Items 都会让客户端 NPE。
+        $removed = 0;
+        foreach ($c->inventory as $slot => $item) {
+            if (!self::hasItem($item['id'])) {
+                unset($c->inventory[$slot]);
+                $removed++;
+            }
+        }
+        if ($removed > 0) {
+            $this->log("  背包清洗：丢掉 {$removed} 个无效物品");
+        }
+        // 排查用：把背包 id 打出来，一眼看出有没有漏网的无效 id
+        $ids = [];
+        foreach ($c->inventory as $slot => $it) {
+            $ids[] = "{$slot}:" . $it['id'];
+        }
+        if ($ids !== []) {
+            $this->log('  背包内容 ' . implode(' ', $ids));
+        }
+        foreach ($c->inventory as $wSlot => $wItem) {
+            if (is_array($wItem) && !empty($wItem['ench'])) {
+                $c->enchWatch[$wSlot] = ['id' => $wItem['id'], 'ench' => $wItem['ench']];
+            }
+        }
+        $this->sendPlayerInventory($c);
+        // 读回上次的经验，并推给客户端（否则经验条永远是空的）
+        $this->loadXpStore();
+        $c->xpTotal = (int) ($this->xpStore[strtolower($c->username)] ?? 0);
+        $total0 = $c->xpTotal;
+        $lv0 = 0;
+        if ($total0 < 272) {
+            $lv0 = intdiv($total0, 17);
+        } elseif ($total0 < 272 + 555) {
+            $lv0 = 16 + intdiv($total0 - 272, 37);
+        } else {
+            $lv0 = 31 + intdiv($total0 - (272 + 555), 62);
+        }
+        // 进度也要按曲线算，不然重进后经验条是空的
+        if ($lv0 <= 16) {
+            $base0 = $lv0 * 17;
+            $need0 = 17;
+        } elseif ($lv0 <= 31) {
+            $base0 = 17 * 16 + ($lv0 - 16) * 37;
+            $need0 = 37;
+        } else {
+            $base0 = 17 * 16 + 37 * 15 + ($lv0 - 31) * 62;
+            $need0 = 62;
+        }
+        $c->xpLevel = $lv0;
+        $c->xpProgress = $need0 > 0 ? min(1.0, ($total0 - $base0) / $need0) : 0.0;
+        $c->send(self::C_SET_EXPERIENCE, (new Writer())
+            ->float($c->xpProgress)->varInt($c->xpLevel)->varInt($c->xpTotal));
+
+        // 进服必须强制发一次 0x06。不发的话客户端一直用默认的 20/20 显示，
+        // 服务端存档里其实是 14/18，看起来就像「饥饿条自己回满」。
+        $c->lastHealth = -1.0;
+        $c->lastFood = -1;
+        $c->wasHungry = false;
+        $this->syncVitals($c, true);
+
+        $c->resendInvAt = microtime(true) + 1.0;
+        $c->resendPeersAt = microtime(true) + 1.0;
+        $c->announceAt = microtime(true) + 1.0;
+
+        // 地上已有的掉落物要重新 Spawn 给这个连接。
+        // 不补的话：客户端根本没有这些实体，东西「看不见但捡得到」——
+        // 因为拾取是服务端按距离算的，不依赖客户端画没画出来。
+        $resent = 0;
+        foreach ($this->drops as $eid => $d) {
+            $this->sendDropSpawn($c, $eid, $d);
+            $resent++;
+        }
+        if ($resent > 0) {
+            $this->log("  补发地上掉落物 {$resent} 个");
+        }
+        $this->log("  载入背包 " . count($c->inventory) . ' 格');
+
+        // 4) 标签列表 / 互相看见
+        // 给新玩家 c 的 Spawn 要延后到 1 秒后（见 resendPeersAt）：
+        // Spawn Player 不带名字，客户端拿 uuid 去 Tab 列表查，Tab 刚到还没进 map，
+        // Java 端会得到个 GameProfile 为 null 的实体。但也不能发两次 Spawn，
+        // eaglercraft 那种网页端收到重复的直接不渲染。
+        // 所以：Tab 立刻发，Spawn 只在 1 秒后发一次。
+        foreach ($this->players() as $other) {
+            $this->sendTabAdd($c, $other);
+            if ($other !== $c) {
+                // 对方已经在游戏里，Tab 早有了，直接 Spawn
+                $this->sendTabAdd($other, $c);
+                // 但「别人看到新玩家」这一半也要延后：mineflayer 的
+                // named_entity_spawn 里有一道 `playerUUID in uuidToUsername` 的检查，
+                // player_info 还没处理完就把 Spawn 丢掉，而且不重试。
+            }
+        }
+
+        // 5) 区块：排队慢慢发。
+        // 以前是 49 个一口气推 3.7MB，客户端接不住（表现就是「进去全是石头，
+        // 放一块方块才啪一下变正常」）。走进去的新区块是每拍 4 个发的，一直是好的。
+        $this->queueChunks($c);
+
+        // 6) 出生点 + 位置同步
+        $c->send(self::C_SPAWN_POSITION, (new Writer())->raw($this->packPositionBytes($sx, $sy, $sz)));
+        $c->send(self::C_POS_LOOK, (new Writer())
+            ->double($c->x)->double($c->y)->double($c->z)
+            ->float($c->yaw)->float($c->pitch)
+            ->byte(0));
+
+        $this->log("  进服 {$c->username}  eid={$c->entityId}  at {$c->x},{$c->y},{$c->z}");
+        $this->emit('onJoin', $this, $c);
+        $this->broadcastChat('§e' . $c->username . ' 加入了游戏', 1);
+        $this->sendChat($c, [
+            'text' => '欢迎。存档：' . $this->world->levelName(),
+            'color' => 'yellow',
+        ], 1);
+        $this->sendChat($c, ['text' => '试试 /gm 1 | /gm 0，或者 /help', 'color' => 'gray'], 1);
+        $this->sendServerAddress($c);
+    }
+
+    /** 进服时把三种连接方式发给玩家，方便转发给朋友 */
+    private function sendServerAddress(Connection $c): void
+    {
+        $host = $this->publicHost !== '' ? $this->publicHost : $this->localIp();
+
+        $this->sendChat($c, ['text' => '服务器地址（可以转发给朋友）', 'color' => 'gold'], 1);
+        $this->sendChat($c, ['text' => '  Java 客户端   ' . $host . ':' . $this->port, 'color' => 'white'], 1);
+        $this->sendChat($c, ['text' => '  网页 / http   ws://' . $host . ':' . $this->port, 'color' => 'white'], 1);
+        if ($this->wssPort > 0) {
+            $this->sendChat($c, ['text' => '  网页 / https  wss://' . $host . ':' . $this->wssPort, 'color' => 'white'], 1);
+        }
+        $this->log("  已发送连接地址 host={$host}");
+    }
+
+    /** 没配 public-address 时，用本机内网 IP 顶上 */
+    private function localIp(): string
+    {
+        $name = gethostname();
+        if ($name === false) {
+            return '127.0.0.1';
+        }
+        $ip = @gethostbyname($name);
+
+        return ($ip !== '' && $ip !== $name) ? $ip : '127.0.0.1';
+    }
+
+    private function sendAbilities(Connection $c): void
+    {
+        $flags = 0;
+        if ($c->gamemode === 1 || $c->gamemode === 3) {
+            $flags |= 0x01 | 0x04 | 0x08;   // 无敌 + 允许飞 + 创造
+        }
+        if ($c->flying) {
+            $flags |= 0x02;
+        }
+        $c->send(self::C_ABILITIES, (new Writer())
+            ->unsignedByte($flags)
+            ->float(0.05)                    // 飞行速度
+            ->float(0.1));                   // 行走速度
+    }
+
+    /** @return Connection[] */
+    // ---------------- 插件 API ----------------
+    // 插件拿到的是 Server 实例，但内部方法几乎都是 private。
+    // 这里放一层薄封装，只暴露「做事」需要的那些，别的一概不给。
+
+    public function loadPlugins(string $dir): void
+    {
+        $this->plugins->loadDir($dir);
+        $n = $this->plugins->count();
+        if ($n === 0) {
+            $this->log('  没装插件');
+
+            return;
+        }
+        $this->log(sprintf('  插件 %d 个：%s', $n, implode('、', $this->plugins->names())));
+        $this->log('  注册的事件：' . implode('、', $this->plugins->events()));
+    }
+
+    public function emit(string $event, mixed ...$args): void
+    {
+        $this->plugins->emit($event, ...$args);
+    }
+
+    public function apiGiveItem(Connection $p, int $id, int $count, array $extra = []): void
+    {
+        $this->giveItem($p, $id, $count, 0, $extra);
+    }
+
+    public function apiChat(Connection $p, string $text): void
+    {
+        $this->sendChat($p, ['text' => $text], 1);
+    }
+
+    public function apiBroadcast(string $text): void
+    {
+        $this->broadcastChat($text);
+    }
+
+    /** @return Connection[] */
+    public function apiPlayers(): array
+    {
+        return $this->players();
+    }
+
+    public function apiBlock(int $x, int $y, int $z): int
+    {
+        return $this->blockIdAt($x, $y, $z);
+    }
+
+    public function apiSetBlock(int $x, int $y, int $z, int $id, int $meta = 0): void
+    {
+        $this->world->chunk($x >> 4, $z >> 4)->setBlock($x & 15, $y, $z & 15, $id, $meta);
+        foreach ($this->players() as $p) {
+            $p->send(self::C_BLOCK_CHANGE, (new Writer())
+                ->raw($this->packPositionBytes($x, $y, $z))
+                ->varInt((($id & 0xFFF) << 4) | ($meta & 15)));
+        }
+    }
+
+    public function apiLog(string $msg): void
+    {
+        $this->log('  [plugin] ' . $msg);
+    }
+
+    public function apiWorld(): AnvilWorld
+    {
+        return $this->world;
+    }
+
+    private function players(): array
+    {
+        $out = [];
+        foreach ($this->conns as $c) {
+            if (!$c->closed && $c->state === Connection::STATE_PLAY) {
+                $out[] = $c;
+            }
+        }
+
+        return $out;
+    }
+
+    private function sendChunkTo(Connection $c, int $cx, int $cz): void
+    {
+        [$mask, $data] = $this->world->chunkPayload($cx, $cz);
+
+        // 防线：按 mask 校验负载长度（每段 4096 方块*2 + 2048 方块光 + 2048 天光 + 末尾 256 生物群系）。
+        // 客户端读多了会直接「connection lost: found N bytes extra」，读少了会越界。
+        // 这里对齐一下，宁可画面差一点也别断线。
+        $secCount = 0;
+        for ($bi = 0; $bi < 16; $bi++) {
+            if (($mask >> $bi) & 1) {
+                $secCount++;
+            }
+        }
+        $expectLen = 256 + 12288 * $secCount;
+        if (strlen($data) !== $expectLen) {
+            $this->log(sprintf('  区块 %d,%d 负载长度异常：%d 应为 %d（mask=%04x）',
+                $cx, $cz, strlen($data), $expectLen, $mask));
+            $data = strlen($data) > $expectLen
+                ? substr($data, 0, $expectLen)
+                : str_pad($data, $expectLen, "\x00");
+        }
+        $c->send(self::C_CHUNK_DATA, (new Writer())
+            ->int($cx)
+            ->int($cz)
+            ->bool(true)                // groundUp
+            ->short($mask)
+            ->varInt(strlen($data))
+            ->raw($data));
+        $c->sentChunks[$cx . ',' . $cz] = true;
+
+        // 区块包只写方块字节，不建 TileEntity。发完立刻补 0x35，
+        // 让客户端在渲染这段区块之前就能拿到箱子实体。
+        // 注意：绝不能先发空气「破状态」—— air 会把区块里已有的箱子方块
+        // 一起打掉，之后补方块也救不回来，玩家看到的就是箱子永久消失。
+        $chunk = $this->world->chunk($cx, $cz);
+        $chests = array_merge($chunk->blockPositions(54), $chunk->blockPositions(146));
+        foreach ($chests as [$x, $y, $z]) {
+            $this->sendTileEntity($c, $x, $y, $z);
+            // 客户端有时在区块还没标成 loaded 时就处理 0x35，TE 建不出来；
+            // 过两秒把箱子所在的段整段重发一次，强制它重建渲染区块。
+            $sy = $y >> 4;
+            $c->chestSections[$cx . ',' . $cz . ',' . $sy] = [$cx, $cz, $sy];
+        }
+
+        // 末影箱（130）：客户端是 ENTITYBLOCK_ANIMATED，靠 TE 渲染。
+        // 顺序必须是「先建 TE，再触发重绘」：
+        //   0x35 -> chunk.getTileEntity(pos, CREATE) 造出 TileEntityEnderChest
+        //   0x23 -> WorldClient.setBlockState(pos, state, 3) 会 markBlockRangeForRenderUpdate
+        //          （状态没变时方块不动，但重绘照样触发）
+        // 只发一次常赶在区块加载完成之前，所以排队重试。
+        foreach ($chunk->blockPositions(130) as [$ecx, $ecy, $ecz]) {
+            $this->nudgeEnderChestRender($c, $ecx, $ecy, $ecz);
+            foreach ([0.6, 1.6, 3.0, 5.0] as $delay) {
+                $c->enderRetries[] = [microtime(true) + $delay, $ecx, $ecy, $ecz];
+            }
+        }
+
+        // 告示牌：0x33 Update Sign，同样随区块补发
+        foreach ($this->world->signsInChunk($cx, $cz) as [$sgx, $sgy, $sgz, $slines]) {
+            // 只对真的是告示牌方块的位置发包。老存档里可能残留
+            // 「Sign TE 存在但方块是书架」的脏数据，发了客户端会报
+            // Unable to locate sign。
+            $sid = $chunk->blockState($sgx & 15, $sgy, $sgz & 15) >> 4;
+            if ($sid !== 63 && $sid !== 68) {
+                continue;
+            }
+            $this->sendSign($c, $sgx, $sgy, $sgz, $slines);
+        }
+
+        // 作物：把这一块里的作物登记进生长表
+        foreach (self::GROW_BLOCKS as $cid) {
+            foreach ($chunk->blockPositions($cid) as [$cx2, $cy2, $cz2]) {
+                $age2 = $chunk->blockState($cx2 & 15, $cy2, $cz2 & 15) & 15;
+                $this->registerCrop($cx2, $cy2, $cz2, $cid, $age2);
+            }
+        }
+
+        // 旗帜：0x35 action=6
+        foreach ($chunk->blockPositions(176) as [$bnx, $bny, $bnz]) {
+            $this->sendBanner($c, $bnx, $bny, $bnz);
+        }
+        foreach ($chunk->blockPositions(177) as [$bnx, $bny, $bnz]) {
+            $this->sendBanner($c, $bnx, $bny, $bnz);
+        }
+
+        // 刷怪笼：登记进内存索引 + 发 0x35（action=1 才是刷怪笼分支）
+        foreach ($chunk->blockPositions(52) as [$spx, $spy, $spz]) {
+            $this->registerSpawner($spx, $spy, $spz);
+            $this->sendSpawner($c, $spx, $spy, $spz);
+        }
+        if ($chests !== []) {
+            $now = microtime(true);
+            // 每 2 秒喂一轮，共 15 轮（30 秒）。客户端什么时候把区块真正加载好，
+            // 下一轮就能把 TE 建出来；建好后多余的轮次是无害的空转。
+            $c->chestSectionTimes = [];
+            for ($i = 0; $i < 15; $i++) {
+                // 前 5 秒内密集补发：客户端加载区块有先后，早发的 0x35 会被丢掉，
+                // 原来 1.5 秒一轮要拖到 20 秒，箱子看着像「半天不出来」。
+                $c->chestSectionTimes[] = $now + 0.2 + 0.35 * $i;
+            }
+        }
+    }
+
+    private function sendTileEntity(Connection $c, int $x, int $y, int $z): void
+    {
+        $nbt = Nbt::write(Tag::compound([
+            'id' => Tag::str('Chest'),
+            'x' => Tag::int($x),
+            'y' => Tag::int($y),
+            'z' => Tag::int($z),
+        ]));
+        // action 只是给少数实体做特殊处理（1 刷怪箱 / 2 命令方块 / 3 告示牌 /
+        // 4 头颅 / 5 / 6），箱子没有特殊分支，填 0 即可。客户端会先按方块
+        // 建出 TileEntityChest，再走这里。
+        $c->send(self::C_UPDATE_TILE_ENTITY, (new Writer())
+            ->raw($this->packPositionBytes($x, $y, $z))
+            ->byte(0)
+            ->raw($nbt));
+    }
+
+    /**
+     * 末影箱的 0x35。和箱子同理：客户端的渲染要等 TileEntityEnderChest 建出来，
+     * 而它只在「查这个位置的 TE」时按方块创建 —— 所以必须发一次这个包。
+     */
+    private function sendEnderChestTE(Connection $c, int $x, int $y, int $z): void
+    {
+        $nbt = Nbt::write(Tag::compound([
+            'id' => Tag::str('EnderChest'),
+            'x' => Tag::int($x),
+            'y' => Tag::int($y),
+            'z' => Tag::int($z),
+        ]));
+        $c->send(self::C_UPDATE_TILE_ENTITY, (new Writer())
+            ->raw($this->packPositionBytes($x, $y, $z))
+            ->byte(0)
+            ->raw($nbt));
+    }
+
+    /**
+     * 让客户端把末影箱画出来。
+     *
+     * 客户端 World.setBlockState 的第一道判断是：
+     *     alz s = chunk.setBlockState(pos, state);
+     *     if (s == null) return false;      // 状态没变就到此为止
+     * 也就是说「发一条同状态的方块变更」根本不会触发重绘 ——
+     * 这就是之前怎么补发都没用的原因。
+     *
+     * 所以这里发一条**改了 meta 的** 130（state 对象不同 → 会走到重绘分支，
+     * 而方块仍是末影箱 → TileEntity 的 shouldRefresh 不成立，TE 不会被删），
+     * 再补 0x35 让客户端建出 TE，最后把 meta 改回去再触发一次重绘。
+     */
+    private function nudgeEnderChestRender(Connection $c, int $x, int $y, int $z): void
+    {
+        // meta 是朝向（2~5），不能乱填 0 —— 那会让重进后的朝向错乱。
+        // 取真实 meta，先用一个「合法的另一个朝向」触发重绘，最后还原。
+        $st = $this->world->chunk($x >> 4, $z >> 4)->blockState($x & 15, $y, $z & 15);
+        $real = $st & 15;
+        if ($real < 2 || $real > 5) {
+            $real = 2;
+        }
+        $alt = ($real === 2) ? 3 : 2;
+
+        foreach ([$alt, $real] as $i => $meta) {
+            $c->send(self::C_BLOCK_CHANGE, (new Writer())
+                ->raw($this->packPositionBytes($x, $y, $z))
+                ->varInt((130 << 4) | $meta));
+            if ($i === 0) {
+                $this->sendEnderChestTE($c, $x, $y, $z);
+            }
+        }
+    }
+
+    /** 给所有在线玩家发一次某格的 TE（放箱子/箱子变化后用） */
+    /**
+     * 告示牌文字包 0x33。
+     * 1.8 的每行是 JSON 文本组件；玩家输入的是纯文本，这里包一层 {"text":...}。
+     */
+    /**
+     * 0x36 SignEditorOpen：只带坐标，客户端收到就弹输入框。
+     * 这是 1.8 里「打开告示牌编辑界面」的唯一途径 ——
+     * 0x33 只负责显示文字，不会弹编辑器。
+     */
+    private function openSignEditor(Connection $c, int $x, int $y, int $z): void
+    {
+        $c->send(self::C_SIGN_EDITOR, (new Writer())
+            ->raw($this->packPositionBytes($x, $y, $z)));
+    }
+
+    private function sendSign(Connection $c, int $x, int $y, int $z, array $lines): void
+    {
+        $lines = array_pad(array_slice(array_values($lines), 0, 4), 4, '');
+        $out = [];
+        foreach ($lines as $t) {
+            $t = (string) $t;
+            $out[] = str_starts_with(ltrim($t), '{')
+                ? $t
+                : json_encode(['text' => $t], JSON_UNESCAPED_UNICODE);
+        }
+        // 关键：客户端那边**必须先有 TileEntitySign**，0x33 才认。
+        // 只发 0x33 会报 "Unable to locate sign at ..."，编辑器也打不开。
+        // 所以先用 0x35(action=3) 建出 TE，再发 0x33 填文字。
+        $c->send(self::C_UPDATE_SIGN, (new Writer())
+            ->raw($this->packPositionBytes($x, $y, $z))
+            ->string($out[0])->string($out[1])->string($out[2])->string($out[3]));
+    }
+
+    /** 刷怪笼要 action=1，客户端才会走「旋转的小怪」那条渲染分支 */
+    private function sendSpawner(Connection $c, int $x, int $y, int $z): void
+    {
+        $k = $x . ',' . $y . ',' . $z;
+        $mob = $this->spawners[$k]['mob'] ?? 54;
+        $nbt = Nbt::write(Tag::compound([
+            'id' => Tag::str('MobSpawner'),
+            'x' => Tag::int($x), 'y' => Tag::int($y), 'z' => Tag::int($z),
+            'EntityId' => Tag::str($this->spawnerMobName($mob)),
+            'Delay' => Tag::short((int) ($this->spawners[$k]['delay'] ?? 20)),
+        ]));
+        $c->send(self::C_UPDATE_TILE_ENTITY, (new Writer())
+            ->raw($this->packPositionBytes($x, $y, $z))
+            ->byte(1)
+            ->raw($nbt));
+    }
+
+    /** 通用实体生成：type 见 1.8 EntityList（1 船 / 30 盔甲架 / 71 展示框…） */
+    private function spawnObject(int $type, float $px, float $py, float $pz, int $data, float $yaw = 0.0): void
+    {
+        $eid = $this->nextEntityId++;
+        foreach ($this->players() as $p) {
+            $w = (new Writer())
+                ->varInt($eid)
+                ->byte($type)
+                ->int((int) ($px * 32))
+                ->int((int) ($py * 32))
+                ->int((int) ($pz * 32))
+                ->byte(0)
+                ->byte((int) ($yaw / 360.0 * 256))
+                ->int($data);
+            // 客户端规定：data > 0 时同一个包里还要跟 3 个 short 速度。
+            // 少这几个字节就会越界崩溃（展示框就是这么炸的）。
+            // 注意必须拼在同一个 Writer 里，不能单独发一个包。
+            if ($data > 0) {
+                $w->short(0)->short(0)->short(0);
+            }
+            $p->send(self::C_SPAWN_OBJECT, $w);
+        }
+        $this->spawnedEntities[$eid] = ['type' => $type, 'x' => $px, 'y' => $py, 'z' => $pz, 'data' => $data];
+        $this->saveEntities();
+        $this->log(sprintf('  生成实体 type=%d eid=%d @ %.1f,%.1f,%.1f data=%d', $type, $eid, $px, $py, $pz, $data));
+    }
+
+    /** 盔甲架：走 Spawn Mob（活体），不是 Spawn Object */
+    private function spawnArmorStand(int $x, int $y, int $z): void
+    {
+        $eid = $this->nextEntityId++;
+        foreach ($this->players() as $p) {
+            $p->send(self::C_SPAWN_MOB, (new Writer())
+                ->varInt($eid)->byte(30)
+                ->int($x * 32)->int($y * 32)->int($z * 32)
+                ->byte(0)->byte(0)->byte(0)
+                ->short(0)->short(0)->short(0)
+                ->unsignedByte(0x00)->unsignedByte(0x00)
+                ->unsignedByte(0x7F));
+        }
+        $this->armorStands[$eid] = [$x, $y, $z];
+        $this->saveEntities();
+        $this->log(sprintf('  生成盔甲架 eid=%d @ %d,%d,%d', $eid, $x, $y, $z));
+    }
+
+    /** 生成一艘船（实体，不是方块）。type=1，data=0 不带速度。 */
+    /**
+     * 从 fromY 往下找最上面一格水，返回它上面那层的 y（船应该浮在这里）。
+     * 找不到水就返回 0，调用方保持原样。
+     */
+    private function waterSurfaceY(int $x, int $z, int $fromY): int
+    {
+        $chunk = $this->world->chunk($x >> 4, $z >> 4);
+        for ($y = min(255, $fromY + 3); $y > 0; $y--) {
+            $id = $chunk->blockState($x & 15, $y, $z & 15) >> 4;
+            if ($id === 8 || $id === 9) {
+                return $y + 1;
+            }
+            // 连着 4 格都不是水/空气，就别往下找了（避免掉进洞里）
+            if ($id !== 0 && $id !== 8 && $id !== 9 && $y < $fromY - 4) {
+                break;
+            }
+        }
+
+        return 0;
+    }
+
+    private function spawnBoat(float $px, float $py, float $pz, float $yaw): void
+    {
+        // 放在水面上，而不是方块顶
+        $surface = $this->waterSurfaceY((int) floor($px), (int) floor($pz), (int) floor($py));
+        if ($surface > 0) {
+            $py = (float) $surface;
+        }
+        $eid = $this->nextEntityId++;
+        // 登记进实体表：既能持久化，右键时也能认出「这是船」
+        $this->spawnedEntities[$eid] = [
+            'type' => 1, 'x' => $px, 'y' => $py, 'z' => $pz, 'data' => 0,
+        ];
+        $this->saveEntities();
+        foreach ($this->players() as $p) {
+            $p->send(self::C_SPAWN_OBJECT, (new Writer())
+                ->varInt($eid)
+                ->byte(1)                       // 1 = 船
+                ->int((int) ($px * 32))
+                ->int((int) ($py * 32))
+                ->int((int) ($pz * 32))
+                ->byte(0)                       // pitch
+                ->byte((int) ($yaw / 360.0 * 256))   // yaw
+                ->int(0));                      // data=0：不带速度
+        }
+        $this->log(sprintf('  生成船 eid=%d @ %.1f,%.1f,%.1f', $eid, $px, $py, $pz));
+    }
+
+    private function sendTileEntityToAll(int $x, int $y, int $z): void
+    {
+        foreach ($this->conns as $p) {
+            if (!$p->closed && $p->username !== '') {
+                $this->sendTileEntity($p, $x, $y, $z);
+            }
+        }
+    }
+
+    private function broadcastTileEntity(int $x, int $y, int $z): void
+    {
+        foreach ($this->players() as $p) {
+            $this->sendTileEntity($p, $x, $y, $z);
+        }
+    }
+
+    private function sendChunks(Connection $c): void
+    {
+        $cx0 = ((int) floor($c->x)) >> 4;
+        $cz0 = ((int) floor($c->z)) >> 4;
+        $r = $this->viewDistance;
+        $sent = 0;
+        $t0 = microtime(true);
+        $bytes = 0;
+
+        for ($dx = -$r; $dx <= $r; $dx++) {
+            for ($dz = -$r; $dz <= $r; $dz++) {
+                $before = strlen($c->out);
+                $this->sendChunkTo($c, $cx0 + $dx, $cz0 + $dz);
+                $bytes += strlen($c->out) - $before;
+                $sent++;
+            }
+        }
+
+        $ms = (microtime(true) - $t0) * 1000;
+        $this->log(sprintf('  发送区块 %d 个，%d KB，耗时 %.0f ms', $sent, round($bytes / 1024), $ms));
+    }
+
+    /** 走进新区块时，把视野里还没发过的区块排进队列。 */
+    private function queueChunks(Connection $c): void
+    {
+        $cx0 = ((int) floor($c->x)) >> 4;
+        $cz0 = ((int) floor($c->z)) >> 4;
+        $r = $this->viewDistance;
+
+        for ($dx = -$r; $dx <= $r; $dx++) {
+            for ($dz = -$r; $dz <= $r; $dz++) {
+                $cx = $cx0 + $dx;
+                $cz = $cz0 + $dz;
+                $key = $cx . ',' . $cz;
+                if (!isset($c->sentChunks[$key]) && !isset($c->chunkQueue[$key])) {
+                    $c->chunkQueue[$key] = [$cx, $cz];
+                }
+            }
+        }
+    }
+
+    /** 每拍最多补 4 个，别一次推几百 KB 把线程堵住。 */
+    private function flushChunkQueue(Connection $c): void
+    {
+        $n = 0;
+        foreach ($c->chunkQueue as $key => [$cx, $cz]) {
+            unset($c->chunkQueue[$key]);
+            $this->sendChunkTo($c, $cx, $cz);
+            if (++$n >= 8) {
+                break;
+            }
+        }
+    }
+
+    private function sendTabAdd(Connection $to, Connection $who): void
+    {
+        $w = (new Writer())
+            ->varInt(0)
+            ->varInt(1)
+            ->raw(hex2bin(str_replace('-', '', $who->uuid)))
+            ->string($who->username);
+
+        // 属性段：name, value, 是否有签名, 签名
+        if ($who->textures !== null) {
+            $w->varInt(1)
+                ->string('textures')
+                ->string($who->textures['value'])
+                ->bool($who->textures['signature'] !== '');
+            if ($who->textures['signature'] !== '') {
+                $w->string($who->textures['signature']);
+            }
+        } else {
+            $w->varInt(0);
+        }
+
+        $w->varInt($who->gamemode)->varInt(0)->bool(false);
+        $to->send(self::C_PLAYER_LIST, $w);
+    }
+
+    private function sendTabRemove(Connection $to, Connection $who): void
+    {
+        $to->send(self::C_PLAYER_LIST, (new Writer())
+            ->varInt(4)
+            ->varInt(1)
+            ->raw(hex2bin(str_replace('-', '', $who->uuid))));
+    }
+
+    private function sendSpawnPlayer(Connection $to, Connection $who): void
+    {
+        $to->send(self::C_SPAWN_PLAYER, (new Writer())
+            ->varInt($who->entityId)
+            ->raw(hex2bin(str_replace('-', '', $who->uuid)))
+            ->int((int) floor($who->x * 32))
+            ->int((int) floor($who->y * 32))
+            ->int((int) floor($who->z * 32))
+            ->byte(self::angle($who->yaw))
+            ->byte(self::angle($who->pitch))
+            ->short(0)
+            ->unsignedByte(0x7F));
+    }
+
+    // ---------------- 游戏内 ----------------
+
+    private function handlePlay(Connection $c, int $id, Reader $r): void
+    {
+        // 记最近 12 个包 id，附魔丢失时能对上「那一刻客户端发了什么」
+        $c->pktLog[] = $id;
+        if (count($c->pktLog) > 12) {
+            array_shift($c->pktLog);
+        }
+
+        switch ($id) {
+            case 0x00: // Keep Alive 回应
+                $c->keepAliveId = 0;
+                $r->readVarInt();
+                break;
+
+            case 0x01: // 聊天 / 命令
+                $msg = $r->readString(100);
+                if ($msg === '') {
+                    break;
+                }
+                $this->emit('onChat', $this, $c, $msg);
+                if ($msg[0] === '/') {
+                    $this->command($c, $msg);
+                } else {
+                    $this->broadcastChat("<{$c->username}> {$msg}", 0);
+                }
+                break;
+
+            case 0x03: // 只报 onGround
+                $c->onGround = $r->readBool();
+                break;
+
+            case 0x04: // Player Position
+                $x = $r->readDouble();
+                $y = $r->readDouble();
+                $z = $r->readDouble();
+                $this->move($c, $x, $y, $z, null, null, $r->readBool());
+                break;
+
+            case 0x05: // Player Look
+                $yaw = $r->readFloat();
+                $pitch = $r->readFloat();
+                $this->move($c, null, null, null, $yaw, $pitch, $r->readBool());
+                break;
+
+            case 0x06: // Player Position And Look
+                $x = $r->readDouble();
+                $y = $r->readDouble();
+                $z = $r->readDouble();
+                $yaw = $r->readFloat();
+                $pitch = $r->readFloat();
+                $this->move($c, $x, $y, $z, $yaw, $pitch, $r->readBool());
+                break;
+
+            case 0x07: // 挖方块 / 丢物品
+                $status = $r->readUnsignedByte();
+                [$x, $y, $z] = $this->unpackPosition($r->readLong());
+                $r->readUnsignedByte(); // face
+                if ($status === 3 || $status === 4) {
+                    // Q 和 Ctrl+Q 在 1.8 里也是这个包，坐标是 0,0,0
+                    $this->dropFromSlot($c, 36 + $c->heldSlot, $status === 3);
+                    break;
+                }
+                if ($status === 5) {
+                    // 松开手中的「使用中物品」—— 拉弓松手就是这一条
+                    $this->shootArrow($c);
+                    break;
+                }
+                $state = ($y >= 0 && $y <= 255)
+                    ? $this->world->chunk($x >> 4, $z >> 4)->blockState($x & 15, $y, $z & 15)
+                    : -1;
+                $this->log("  挖 status={$status} @ {$x},{$y},{$z} 服务端方块={$state} 模式={$c->gamemode}");
+                // 创造点一下就碎；生存里硬度 0 的方块（花、枯木、甘蔗、高草…）
+                // 也是一碰就碎，不等 status=2。
+                $instant = $status === 0
+                    && in_array($state >> 4, self::INSTANT_BREAK, true);
+                if (($c->gamemode === 1 && $status === 0)
+                    || ($c->gamemode !== 1 && ($status === 2 || $instant))) {
+                    if ($state === 0) {
+                        // 客户端以为这里有方块，服务端这边是空气。
+                        // 直接把这个「空气」打回去，客户端收到就会把幽灵方块擦掉。
+                        $c->send(self::C_BLOCK_CHANGE, (new Writer())
+                            ->raw($this->packPositionBytes($x, $y, $z))
+                            ->varInt(0));
+                    } else {
+                        $this->breakBlock($c, $x, $y, $z);
+                    }
+
+                    // 不管碎没碎，都把「服务端认为这块是什么」打回去。
+                    // 这样客户端要是画错了（比如它显示枯木、服务端其实是高草），
+                    // 下一眼就会看到真身，而不是一直显示幽灵。
+                    $now2 = $this->world->chunk($x >> 4, $z >> 4)
+                        ->blockState($x & 15, $y, $z & 15);
+                    $c->send(self::C_BLOCK_CHANGE, (new Writer())
+                        ->raw($this->packPositionBytes($x, $y, $z))
+                        ->varInt($now2));
+                }
+                break;
+
+            case 0x08: // 放方块 / 使用方块
+                [$x, $y, $z] = $this->unpackPosition($r->readLong());
+                $face = $r->readUnsignedByte();
+
+                // 末地：在基座四个边中点的基岩上放末影水晶，四颗齐了重召龙
+                if ($this->tryPlaceSummonCrystal($c, $x, $y, $z)) {
+                    break;
+                }
+
+                // 末地传送门框架：嵌末影之眼，12 颗齐了激活
+                if ($this->tryActivateEndPortal($c, $x, $y, $z)) {
+                    break;
+                }
+
+                // 排查用：右键任何东西都会打这一行（含手上物品 id）
+                if ($this->debugLog) {
+                    $hm = $c->inventory[36 + $c->heldSlot] ?? null;
+                    $this->log(sprintf('  [0x08] 使用/放置 @ %d,%d,%d 面=%d 手持=%s',
+                        $x, $y, $z, $face,
+                        $hm === null ? '空' : $hm['id'] . 'x' . $hm['count']));
+                }
+
+                // 坐标 (-1,-1) 表示「使用了手上的物品」（吃东西、喝药），
+                // 不是对着方块操作。1.8 里吃食物就走这个包。
+                if ($x === -1 && $z === -1) {
+                    $useId = $r->readShort();
+                    if ($useId > 0) {
+                        $this->useItem($c, $useId);
+                    }
+                    break;
+                }
+
+                // 先看点到的是什么：箱子这类是「使用」，不是「放置」。
+                // 必须放在「手上是不是方块」判断之前 —— 空手右键箱子时
+                // itemId 是 -1，先判就永远走不到这里。
+                $hitId = $this->world->chunk($x >> 4, $z >> 4)
+                    ->blockState($x & 15, $y, $z & 15) >> 4;
+                if ($hitId === 54) {
+                    $this->openChest($c, $x, $y, $z);
+                    break;
+                }
+                // 床：晚上右键直接睡到天亮（不模拟躺下动画，最省事也最稳）
+                // 末影箱：每个玩家一份 27 格，跨箱子共享
+                if ($hitId === 116) {
+                    $this->openEnchantTable($c, $x, $y, $z);
+                    break;
+                }
+
+                if ($hitId === 117) {
+                    $this->openBrewingStand($c, $x, $y, $z);
+                    break;
+                }
+
+                if ($hitId === 130) {
+                    $this->openEnderChest($c);
+                    break;
+                }
+
+                // 告示牌：右键要让客户端打开编辑界面。
+                // 1.8 里 S33 既是「显示文字」也是「打开编辑器」——
+                // 客户端收到且距离 <8 格就会弹出输入框。
+                if ($hitId === 63 || $hitId === 68) {
+                    $this->openSignEditor($c, $x, $y, $z);
+                    foreach ($this->world->signsInChunk($x >> 4, $z >> 4) as [$sgx, $sgy, $sgz, $slines]) {
+                        if ($sgx === $x && $sgy === $y && $sgz === $z) {
+                            $this->sendSign($c, $sgx, $sgy, $sgz, $slines);
+                            break;
+                        }
+                    }
+                    break;
+                }
+
+                if ($hitId === 26) {
+                    if ($this->isNight()) {
+                        // 躺下：0x0A Use Bed。
+                        // 顺便把这张床记成重生点 —— 之前只做了「躺下」，
+                        // 死了还是回世界出生点，床白睡了。
+                        $c->bedSpawn = [(float) $x + 0.5, (float) $y + 1.0, (float) $z + 0.5];
+                        $this->sleeping[$c->entityId] = microtime(true) + 5.0;
+                        $bedPos = $this->packPositionBytes($x, $y, $z);
+                        foreach ($this->players() as $sv) {
+                            $sv->send(self::C_USE_BED, (new Writer())
+                                ->varInt($c->entityId)->raw($bedPos));
+                        }
+                        $this->sendChat($c, ['text' => '你躺下了……', 'color' => 'gray'], 1);
+                        $this->log('  ' . $c->username . ' 躺下 @ ' . $x . ',' . $y . ',' . $z);
+                    } else {
+                        $this->sendChat($c, ['text' => '现在还是白天，睡不着。', 'color' => 'gray'], 1);
+                    }
+                    break;
+                }
+
+                if (in_array($hitId, [54, 146], true) || ($hitId === 47 && $this->chests->has($x, $y, $z))) {
+                    $this->openChest($c, $x, $y, $z);
+                    break;
+                }
+                // 拉杆(69) / 按钮(77)：右键切换开关位，changeBlock 会自动重算红石
+                if ($hitId === 69 || $hitId === 77) {
+                    $st = $this->world->chunk($x >> 4, $z >> 4)->blockState($x & 15, $y, $z & 15);
+                    $m = ($st & 0x0F) ^ 0x8;
+                    $this->changeBlock($x, $y, $z, $hitId, $m);
+                    $this->log("  {$c->username} " . ($hitId === 69 ? '拉杆' : '按钮')
+                        . (($m & 0x8) ? '打开' : '关闭') . " @ {$x},{$y},{$z}");
+                    break;
+                }
+
+                // 145 = 铁砧
+                if ($hitId === 145) {
+                    $this->openAnvil($c, $x, $y, $z);
+                    break;
+                }
+
+                // 62 = 点亮的熔炉：燃烧时方块 id 会变成 62，右键也得认
+                if ($hitId === 61 || $hitId === 62 || $hitId === 133) {
+                    if ($this->hasFurnace($x, $y, $z)) {
+                        $this->openFurnace($c, $x, $y, $z);
+                        $this->log("  打开熔炉 {$x},{$y},{$z}");
+                    } else {
+                        $this->log("  绿宝石块 @ {$x},{$y},{$z} 没有熔炉记录");
+                        $this->sendChat($c, ['text' => '这块绿宝石块没有熔炉记录——放一个熔炉试试。', 'color' => 'gray'], 1);
+                    }
+                    break;
+                }
+                if ($hitId === 58) {
+                    $this->openWorkbench($c);
+                    break;
+                }
+
+                // 服务端这里是空气，客户端却对着它右键：说明客户端留了一块
+                // 「幽灵方块」（放置被拒后客户端不会自己撤销预测）。如果旁边
+                // 挨着真箱子，就把空气打回去擦掉幽灵，并打开那个真箱子 ——
+                // 表现就是「上面的箱子点不开」。
+                if ($hitId === 0 && $face <= 5) {
+                    $near = $this->chestNextTo($x, $y, $z, $face);
+                    if ($near !== null) {
+                        $c->send(self::C_BLOCK_CHANGE, (new Writer())
+                            ->raw($this->packPositionBytes($x, $y, $z))
+                            ->varInt(0));
+                        $this->log("  幽灵方块 @ {$x},{$y},{$z} -> 打开真箱子 {$near[0]},{$near[1]},{$near[2]}");
+                        $this->openChest($c, $near[0], $near[1], $near[2]);
+                        break;
+                    }
+                }
+
+                $itemId = $r->readShort();
+                // 锄头锄地：草/土 -> 耕地(60)，耐久-1
+                if (in_array($itemId, [290, 291, 292, 293, 294], true)
+                    && ($hitId === 2 || $hitId === 3)) {
+                    $above = $this->world->chunk($x >> 4, $z >> 4)
+                        ->blockState($x & 15, $y + 1, $z & 15);
+                    if ($above === 0) {      // 上面不能有方块
+                        // 不能走 changeBlock —— 它是「放置」逻辑，会拒收实心方块。
+                        // 锄地本质是把草/土替换成耕地，直接写 + 广播。
+                        $ch = $this->world->chunk($x >> 4, $z >> 4);
+                        $ch->setBlock($x & 15, $y, $z & 15, 60, 0);
+                        $ch->dirty = true;
+                        foreach ($this->players() as $p2) {
+                            $p2->send(self::C_BLOCK_CHANGE, (new Writer())
+                                ->raw($this->packPositionBytes($x, $y, $z))
+                                ->varInt(60 << 4));
+                        }
+                        $hs3 = 36 + $c->heldSlot;
+                        if (isset($c->inventory[$hs3])) {
+                            $it3 = $c->inventory[$hs3];
+                            $it3['damage'] = (int) ($it3['damage'] ?? 0) + 1;
+                            if ($it3['damage'] >= (self::TOOL_MAX[$itemId] ?? 60)) {
+                                unset($c->inventory[$hs3]);
+                            } else {
+                                $c->inventory[$hs3] = $it3;
+                            }
+                            $this->sendPlayerInventory($c);
+                        }
+                        $this->log("  {$c->username} 锄地 @ {$x},{$y},{$z}");
+                        break;
+                    }
+                }
+
+                // 骨粉（351:15）催熟作物
+                if ($itemId === 351) {
+                    $hs2 = 36 + $c->heldSlot;
+                    $heldDmg = (int) ($c->inventory[$hs2]['damage'] ?? -1);
+                    if ($heldDmg === 15 && $this->boneMeal($x, $y, $z)) {
+                        if (isset($c->inventory[$hs2])) {
+                            if (--$c->inventory[$hs2]['count'] <= 0) {
+                                unset($c->inventory[$hs2]);
+                            }
+                            $this->sendPlayerInventory($c);
+                        }
+                        $this->log("  {$c->username} 骨粉催熟 @ {$x},{$y},{$z}");
+                        break;
+                    }
+                    // 不是骨粉或者没催熟成功：继续走原来的放置逻辑
+                }
+
+
+                // 水桶(326) / 岩浆桶(327)：不是方块，单独处理
+                if ($itemId === 326 || $itemId === 327) {
+                    [$fx, $fy, $fz] = self::offsetByFace($x, $y, $z, $face);
+                    $tid = $this->world->chunk($fx >> 4, $fz >> 4)
+                        ->blockState($fx & 15, $fy, $fz & 15) >> 4;
+                    if ($tid === 0) {
+                        $this->placeFluid($fx, $fy, $fz, $itemId === 326 ? 0 : 1);
+                        // 生存模式：桶变成空桶
+                        if ($c->gamemode !== 1) {
+                            $hs = 36 + $c->heldSlot;
+                            $held = $c->inventory[$hs] ?? null;
+                            if ($held !== null && $held['id'] === $itemId) {
+                                if ($held['count'] > 1) {
+                                    $held['count']--;
+                                    $c->inventory[$hs] = $held;
+                                    $this->giveItem($c, 325, 1, 0);
+                                } else {
+                                    $c->inventory[$hs] = ['id' => 325, 'count' => 1, 'damage' => 0];
+                                }
+                                $this->sendInventorySlot($c, $hs, $c->inventory[$hs] ?? null);
+                            }
+                        }
+                        $this->log("  {$c->username} 倒出" . ($itemId === 326 ? '水' : '岩浆')
+                            . " @ {$fx},{$fy},{$fz}");
+                    }
+                    break;
+                }
+
+                if ($itemId === 383) {
+                    // 刷怪蛋：damage 就是生物类型
+                    $r->readByte();
+                    $eggMeta = $r->readShort();
+                    // 1.8 里刷怪蛋的 damage 直接就是生物 id（EntityList 的 id），
+                    // 没有任何偏移。之前写成 -32，猪蛋(90) 就变成了末影人(58)。
+                    $type = $eggMeta;
+                    if (isset(self::MOB_TYPES[$type])) {
+                        [$tx, $ty, $tz] = self::offsetByFace($x, $y, $z, $face);
+                        $gy = $this->groundY($tx, $tz, $ty + 2);
+                        $this->spawnMob($type, $tx + 0.5, (float) ($gy > 0 ? $gy : $ty), $tz + 0.5);
+                        $this->log("  {$c->username} 用刷怪蛋生成了 " . self::MOB_TYPES[$type][0]);
+                    }
+                    break;
+                }
+                if ($itemId <= 0) {
+                    break; // 手上不是方块
+                }
+                // 1.8 有一部分物品 id 和方块 id 不是同一个数（甘蔗、种子、作物…），
+                // 直接拿物品 id 当方块 id 会让服务端拒绝放置。
+                // 画(321)：走 0x10 Spawn Painting，不是 Spawn Object。
+                // 只放 1x1 的画（kebab/aztec 这些），位置就是点击的那一格，
+                // 不用算多格尺寸的角点偏移 —— 大的等以后再做。
+                if ($itemId === 321) {
+                    $pd = ($face >= 2 && $face <= 5) ? ($face - 2) : 0;
+                    // EnumArt 的名字是首字母大写的，全小写 byName 查不到 → 返回 null
+                    // → 客户端拿 null 建实体，直接崩（就是「游戏因为实体 null 崩溃」）。
+                    $titles = ['Kebab', 'Aztec', 'Alban', 'Aztec2', 'Bomb', 'Plant', 'Wasteland'];
+                    $title = $titles[random_int(0, count($titles) - 1)];
+                    $peid = $this->nextEntityId++;
+                    foreach ($this->players() as $pp2) {
+                        // gs 的字段顺序（客户端 gs.java:27-34）：
+                        //   string 标题, int x, int y, int z, float 朝向, byte 方向
+                        // 不是 long 坐标，也没有 eid —— 之前两处都写错了，
+                        // 客户端按 float 读就会越界崩溃。
+                        $pp2->send(self::C_SPAWN_PAINTING, (new Writer())
+                            ->string($title)
+                            ->int($x)->int($y)->int($z)
+                            ->float((float) $c->yaw)
+                            ->byte($pd));
+                    }
+                    $this->paintings[] = [$x, $y, $z, $title, $pd, (float) $c->yaw];
+                    $this->saveEntities();
+                    $this->log("  {$c->username} 放画 {$title} @ {$x},{$y},{$z} 朝向 {$pd}");
+                    $slot6 = 36 + $c->heldSlot;
+                    if (isset($c->inventory[$slot6])) {
+                        if (--$c->inventory[$slot6]['count'] <= 0) {
+                            unset($c->inventory[$slot6]);
+                        }
+                        $this->sendPlayerInventory($c);
+                    }
+                    break;
+                }
+
+                // 展示框(389)：Spawn Object type=71，data 是朝向
+                if ($itemId === 389) {
+                    // 客户端 bcy.java 里 type=71 是这么建的：
+                    //   new EntityItemFrame(world, new BlockPos(floor(x),floor(y),floor(z)),
+                    //                       EnumFacing.byIndex(data))
+                    // 所以位置必须是**方块坐标**（不能 +0.5），
+                    // data 是 EnumFacing 索引：2=北 3=南 4=西 5=东。
+                    $d = ($face >= 2 && $face <= 5) ? $face : 3;
+                    $this->spawnObject(71, (float) $x, (float) $y, (float) $z, $d);
+                    $slot4 = 36 + $c->heldSlot;
+                    if (isset($c->inventory[$slot4])) {
+                        if (--$c->inventory[$slot4]['count'] <= 0) {
+                            unset($c->inventory[$slot4]);
+                        }
+                        $this->sendPlayerInventory($c);
+                    }
+                    $this->log("  {$c->username} 放展示框 @ {$x},{$y},{$z} 朝向 {$d}");
+                    break;
+                }
+
+                // 盔甲架(30)：它是「活体」，客户端 Spawn Object 的分支里没有 30，
+                // 必须走 Spawn Mob(0x0F)。参数：eid,type,x,y,z,yaw,pitch,headPitch,
+                // vx,vy,vz, metadata(至少一条结束标记)。
+                if ($itemId === 416) {
+                    // 站到点击方块的上面一格，否则会陷进地里半个身子
+                    $this->spawnArmorStand($x, $y + 1, $z);
+                    $slot5 = 36 + $c->heldSlot;
+                    if (isset($c->inventory[$slot5])) {
+                        if (--$c->inventory[$slot5]['count'] <= 0) {
+                            unset($c->inventory[$slot5]);
+                        }
+                        $this->sendPlayerInventory($c);
+                    }
+                    $this->log("  {$c->username} 放盔甲架 @ {$x},{$y},{$z}");
+                    break;
+                }
+
+                // 船是实体不是方块，必须在 blockId 判定之前拦下来 ——
+                // 否则 blockId=0 会被当成无效放置直接拒掉。
+                if ($itemId === 333) {
+                    $this->spawnBoat($x + 0.5, $y + 1.0, $z + 0.5, $c->yaw);
+                    $slot2 = 36 + $c->heldSlot;
+                    if (isset($c->inventory[$slot2])) {
+                        if (--$c->inventory[$slot2]['count'] <= 0) {
+                            unset($c->inventory[$slot2]);
+                        }
+                        $this->sendPlayerInventory($c);
+                    }
+                    $this->log("  {$c->username} 放船 @ {$x},{$y},{$z}");
+                    break;
+                }
+
+                // 打火石(259) 不是方块：必须在「blockId<=0 就 break」之前处理，
+                // 否则永远走不到（它不在 PLACEABLE_ITEM 里，blockId 会算成 0）。
+                if ($itemId === 259) {
+                    [$ftx, $fty, $ftz] = self::offsetByFace($x, $y, $z, $face);
+                    if ($this->tryIgnitePortal($c, $ftx, $fty, $ftz)) {
+                        if ($c->gamemode !== 1) {
+                            $hs3 = 36 + $c->heldSlot;
+                            $h3 = $c->inventory[$hs3] ?? null;
+                            if (is_array($h3) && (int) $h3['id'] === 259) {
+                                $h3['damage'] = (int) ($h3['damage'] ?? 0) + 1;
+                                if ($h3['damage'] >= 65) {
+                                    unset($c->inventory[$hs3]);
+                                    $this->sendSlot($c, $hs3, null);
+                                } else {
+                                    $c->inventory[$hs3] = $h3;
+                                    $this->sendSlot($c, $hs3, $h3);
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    $fcur = $this->world->chunk($ftx >> 4, $ftz >> 4)
+                        ->blockState($ftx & 15, $fty, $ftz & 15);
+                    if (($fcur >> 4) === 0) {
+                        $this->changeBlock($ftx, $fty, $ftz, 51, 0);
+                        if ($this->tryIgnitePortal($c, $ftx, $fty, $ftz)) {
+                            $this->changeBlock($ftx, $fty, $ftz, 0, 0);
+                        }
+                    }
+                    $this->log("  {$c->username} 打火石 @ {$ftx},{$fty},{$ftz}");
+                    break;
+                }
+
+                $blockId = $itemId <= 255 ? $itemId : (self::PLACEABLE_ITEM[$itemId] ?? 0);
+                if ($blockId <= 0) {
+                    break; // 这个物品不能当方块放
+                }
+                $r->readByte();               // count
+                $damage = $r->readShort();     // 方块 meta 藏在 damage 里
+
+                [$tx, $ty, $tz] = self::offsetByFace($x, $y, $z, $face);
+                if (!$this->canPlaceOn($blockId, $tx, $ty, $tz)) {
+                    // 客户端已经先画上去了，把服务端的真实状态打回去让它回弹
+                    $now = $this->world->chunk($tx >> 4, $tz >> 4)
+                        ->blockState($tx & 15, $ty, $tz & 15);
+                    $c->send(self::C_BLOCK_CHANGE, (new Writer())
+                        ->raw($this->packPositionBytes($tx, $ty, $tz))
+                        ->varInt($now));
+                    $this->log("  放 方块{$blockId} @ {$tx},{$ty},{$tz} 被拒：这个位置不能种");
+                    break;
+                }
+                $this->log("  放 方块{$blockId} @ {$tx},{$ty},{$tz}（物品 {$itemId}，点的 {$x},{$y},{$z} 面 {$face}）");
+                // 箱子(54)不再真的放进世界：客户端把它设成 BlockContainer 方块
+                // 会在 1.8.9 上抛 NPE，方块状态永远落不了地。
+                // 改成放书架(47) + 在 ChestStore 里留一条记录，右键照样开箱。
+                if ($blockId === 61) {
+                    // 真的放熔炉(61)。熔炉的模型是静态的，不像箱子那样依赖 TE 才渲染，
+                    // 所以放下去就应该看得见。（以前用绿宝石块 133 冒充）
+                    $fi = ((int) floor($c->yaw * 4.0 / 360.0 + 0.5)) & 3;
+                    $furnaceMeta = [2, 5, 3, 4][$fi];
+                    $this->changeBlock($tx, $ty, $tz, 61, $furnaceMeta);
+                    $this->ensureFurnace($tx, $ty, $tz);
+                    $blockId = 61;
+                } elseif ($blockId === 176) {
+                    // 旗帜：站立式 meta 是按 yaw 的朝向（0~15），挂墙的用点击面
+                    if ($face >= 2) {
+                        $blockId = 177;
+                        $bm = $face;
+                    } else {
+                        $bm = ((int) floor(($c->yaw + 180.0) * 16.0 / 360.0 + 0.5)) & 15;
+                    }
+                    $this->changeBlock($tx, $ty, $tz, $blockId, $bm);
+                    // 颜色来自手上那面旗帜的 damage（0~15）
+                    $heldSlot3 = 36 + $c->heldSlot;
+                    $bcolor = (int) ($c->inventory[$heldSlot3]['damage'] ?? 0) & 15;
+                    $this->setBanner($tx, $ty, $tz, $bcolor);
+                    foreach ($this->players() as $bp) {
+                        $this->sendBanner($bp, $tx, $ty, $tz);
+                    }
+                } elseif ($blockId === 65 || $blockId === 68) {
+                    // 梯子 / 墙上的告示牌：meta 表示「贴在哪一面墙」，必须是 2~5。
+                    // 写 0 客户端画不出来 —— 这就是「梯子 reload 后消失」的真相：
+                    // 方块一直在，只是没有方向、渲染不出来。
+                    $faceMeta = ($face >= 2 && $face <= 5) ? $face : 2;
+                    $this->changeBlock($tx, $ty, $tz, $blockId, $faceMeta);
+                    $blockId = $blockId;
+                } elseif ($blockId === 63) {
+                    // 站立的告示牌：meta 是按 yaw 算的朝向（0~15）
+                    $signMeta = ((int) floor(($c->yaw + 180.0) * 16.0 / 360.0 + 0.5)) & 15;
+                    $this->changeBlock($tx, $ty, $tz, 63, $signMeta);
+                } elseif ($blockId === 54 || $blockId === 146) {
+                    // 箱子(54) / 陷阱箱(146)：真正的方块，朝向按玩家 yaw 算
+                    // （原版 BlockChest 的算法 0→北2 1→东5 2→南3 3→西4）
+                    $chestId = $blockId;    // 记住是哪种箱子
+                    $di = ((int) floor($c->yaw * 4.0 / 360.0 + 0.5)) & 3;
+                    $chestMeta = [2, 5, 3, 4][$di];
+                    $this->changeBlock($tx, $ty, $tz, $chestId, $chestMeta);
+                    $this->chests->ensure($tx, $ty, $tz);
+                    $this->sendTileEntityToAll($tx, $ty, $tz);
+                    $blockId = $chestId;
+                } elseif ($blockId === 8 || $blockId === 9) {
+                    // 水：放下源头，然后排队扩散
+                    $this->placeFluid($tx, $ty, $tz, 0);
+                    $blockId = 8;
+                } elseif ($blockId === 10 || $blockId === 11) {
+                    // 岩浆：同上，但只流 3 格
+                    $this->placeFluid($tx, $ty, $tz, 1);
+                    $blockId = 10;
+                } elseif ($blockId === 26) {
+                    // 床：两格宽。foot + head 一起放，head 的 meta 加 0x8。
+                    $i = ((int) floor(fmod($c->yaw, 360.0) / 90.0 + 0.5)) & 3;
+                    // 0 南(+z) 1 西(-x) 2 北(-z) 3 东(+x)
+                    $off = [[0, 1], [-1, 0], [0, -1], [1, 0]][$i];
+                    $hx = $tx + $off[0];
+                    $hz = $tz + $off[1];
+                    $this->changeBlock($tx, $ty, $tz, 26, $i);
+                    $this->changeBlock($hx, $ty, $hz, 26, $i | 0x8);
+                    $blockId = 26;
+                } elseif ($blockId === 64 || $blockId === 71) {
+                    // 门：两格高。下半 0-3 朝向，上半 = 下半 | 0x8。
+                    $i = ((int) floor(fmod($c->yaw, 360.0) / 90.0 + 0.5)) & 3;
+                    $doorMeta = ($i + 1) & 3;
+                    $this->changeBlock($tx, $ty, $tz, $blockId, $doorMeta);
+                    if ($ty < 255) {
+                        $this->changeBlock($tx, $ty + 1, $tz, $blockId, $doorMeta | 0x8);
+                    }
+                    $blockId = $blockId;
+                } elseif ($itemId === 259) {
+                    // 打火石（259）：在点到的位置放火（51），并扣 1 点耐久
+                    $cur = $this->world->chunk($tx >> 4, $tz >> 4)
+                        ->blockState($tx & 15, $ty, $tz & 15);
+                    // 【不管点的是什么，先试试点燃地狱门】
+                    // 玩家点的是框「内部那格空气」（点的面是底部黑曜石的上表面），
+                    // 之前要求「目标格是黑曜石」才试，于是永远点不着，只生成火。
+                    if ($this->tryIgnitePortal($c, $tx, $ty, $tz)) {
+                        if ($c->gamemode !== 1) {
+                            $hs2 = 36 + $c->heldSlot;
+                            $h2 = $c->inventory[$hs2] ?? null;
+                            if (is_array($h2) && (int) $h2['id'] === 259) {
+                                $h2['damage'] = (int) ($h2['damage'] ?? 0) + 1;
+                                if ($h2['damage'] >= 65) {
+                                    unset($c->inventory[$hs2]);
+                                    $this->sendSlot($c, $hs2, null);
+                                } else {
+                                    $c->inventory[$hs2] = $h2;
+                                    $this->sendSlot($c, $hs2, $h2);
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    if (($cur >> 4) === 0) {
+                        $this->changeBlock($tx, $ty, $tz, 51, 0);
+                        // 原版就是「火点进框里 → 变传送门」。
+                        // 放完火再认一次框，比「点击那一刻判框」稳得多。
+                        if ($this->tryIgnitePortal($c, $tx, $ty, $tz)) {
+                            $this->changeBlock($tx, $ty, $tz, 0, 0);   // 火撤掉
+                        }
+                    }
+                    if ($c->gamemode !== 1) {
+                        $hs = 36 + $c->heldSlot;
+                        $hh = $c->inventory[$hs] ?? null;
+                        if (is_array($hh) && (int) $hh['id'] === 259) {
+                            $hh['damage'] = (int) ($hh['damage'] ?? 0) + 1;
+                            if ($hh['damage'] >= 65) {
+                                unset($c->inventory[$hs]);
+                                $this->sendSlot($c, $hs, null);
+                            } else {
+                                $c->inventory[$hs] = $hh;
+                                $this->sendSlot($c, $hs, $hh);
+                            }
+                        }
+                    }
+                    $this->log("  {$c->username} 打火石点火 @ {$tx},{$ty},{$tz}"
+                        . ' 耐久=' . (($c->inventory[36 + $c->heldSlot]['damage'] ?? '已用坏')));
+                    break;
+                } else {
+                    $this->changeBlock($tx, $ty, $tz, $blockId, $this->placeMeta($c, $blockId, $damage & 0x0F));
+                }
+
+                // 放置成功要扣手里的方块。少了这一步：客户端本地把 13 减成 12，
+                // 下一次整窗重发又推回服务端的 13 —— 玩家看到的就是
+                // 「消耗完的东西又回来了，放的方块还不消失」。
+                $placed = ($this->world->chunk($tx >> 4, $tz >> 4)
+                    ->blockState($tx & 15, $ty, $tz & 15) >> 4) === $blockId;
+                $heldSlot = 36 + $c->heldSlot;
+                $held = $c->inventory[$heldSlot] ?? null;
+                $this->log('  放置结算：模式=' . $c->gamemode
+                    . ' 手上=' . ($held === null ? '空' : $held['id'] . 'x' . $held['count'])
+                    . ' 物品id=' . $itemId . ' 世界方块=' . $blockId
+                    . ' placed=' . ($placed ? 1 : 0));
+                if ($placed && $c->gamemode !== 1) {
+                    if ($held !== null && ($held['id'] === $itemId || $held['id'] === $blockId)) {
+                        if ($held['count'] > 1) {
+                            $held['count']--;
+                            $c->inventory[$heldSlot] = $held;
+                            $this->sendInventorySlot($c, $heldSlot, $held);
+                        } else {
+                            unset($c->inventory[$heldSlot]);
+                            $this->sendInventorySlot($c, $heldSlot, null);
+                        }
+                    }
+                }
+                break;
+
+            case 0x10: // 创造模式从背包拿东西
+                $slot = $r->readShort();
+                $start = $r->mark();
+                $itemId = $r->readShort();     // -1 表示清空
+                $count = $itemId >= 0 ? $r->readUnsignedByte() : 0;
+                $damage = $itemId >= 0 ? $r->readShort() : 0;
+                $raw = $r->sliceFrom($start);  // 连 NBT 一起原样回传
+                if ($slot >= 0 && $slot <= 44) {
+                    if ($itemId < 0) {
+                        unset($c->inventory[$slot]);
+                    } else {
+                        // 这里以前只存 id/count/damage，NBT 被丢掉 ——
+                        // 创造模式拖一件附魔装备，附魔就没了（日志里 0x10 连续刷屏就是它）。
+                        $item = ['id' => $itemId, 'count' => $count, 'damage' => $damage];
+                        if ($r->remaining() > 0) {
+                            $flag = $r->readUnsignedByte();
+                            if ($flag !== 0 && $r->remaining() > 0) {
+                                try {
+                                    $tag = Nbt::parse($r->rest());
+                                    $enchTag = $tag->value['ench'] ?? null;
+                                    if ($enchTag !== null) {
+                                        $lst = is_array($enchTag->value) ? ($enchTag->value['items'] ?? []) : [];
+                                        $en = [];
+                                        foreach ($lst as $e) {
+                                            if (isset($e->value['id'], $e->value['lvl'])) {
+                                                $en[] = [
+                                                    'id' => (int) $e->value['id']->value,
+                                                    'lvl' => (int) $e->value['lvl']->value,
+                                                ];
+                                            }
+                                        }
+                                        if ($en !== []) {
+                                            $item['ench'] = $en;
+                                        }
+                                    }
+                                } catch (\Throwable $e) {
+                                    // NBT 坏了就当没有，不影响这次放置
+                                }
+                            }
+                        }
+                        $c->inventory[$slot] = $item;
+                    }
+                    // 必须回一个 Set Slot，不然客户端刚拿到手又把方块收回去
+                    $c->send(self::C_SET_SLOT, (new Writer())
+                        ->byte(0)
+                        ->short($slot)
+                        ->raw($raw));
+                }
+                break;
+
+            case 0x0B: // Entity Action：蹲/起身/离开床
+                $r->readVarInt();            // entityId
+                $eaAction = $r->readVarInt();
+                $r->readVarInt();            // jumpBoost
+                if ($eaAction === 2) {       // STOP_SLEEPING：玩家点了「起床」
+                    // 客户端在睡觉界面会每拍都发，所以只在真的睡着时处理一次
+                    if (isset($this->sleeping[$c->entityId])) {
+                        unset($this->sleeping[$c->entityId]);
+                        $this->wakePlayer($c);
+                    }
+                }
+                break;
+
+            case 0x09: // 切换手上的快捷栏格
+                $c->heldSlot = max(0, min(8, $r->readShort()));
+                break;
+
+            case 0x0A: // 挥手：广播给别人，不然对面看不到你在打
+                $packet = (new Writer())
+                    ->varInt($c->entityId)
+                    ->byte(0);            // 0 = 挥主手
+                foreach ($this->players() as $p) {
+                    if ($p !== $c) {
+                        $p->send(self::C_ANIMATION, $packet);
+                    }
+                }
+                break;
+
+            case 0x02: // Use Entity（攻击 / 交互）
+                $targetEid = $r->readVarInt();
+                $action = $r->readByte();
+                if ($action === 0 || $action === 2) {   // 交互 / 对着某点交互
+                    $target = $this->spawnedEntities[$targetEid] ?? null;
+                    if (is_array($target) && (int) $target['type'] === 1) {
+                        // 上船：Attach Entity（玩家 eid + 载具 eid）
+                        $c->riding = $targetEid;
+                        foreach ($this->players() as $pp) {
+                            $pp->send(self::C_ATTACH_ENTITY, (new Writer())
+                                ->int($c->entityId)->int($targetEid)->byte(0));
+                        }
+                        $this->log("  {$c->username} 上船 eid={$targetEid}");
+                        break;
+                    }
+                    break;
+                }
+                if ($action === 1) {          // 1 = 攻击
+                    // 打末影龙（龙是单个 eid，客户端自己画七个部位）
+                    // 客户端打的是龙的「部位」：EntityDragon.setEntityId 会把七个 part
+                    // 设成 id+1..id+7，所以 targetEid 不会等于本体 eid。
+                    if ($this->dragon !== null
+                        && $targetEid >= $this->dragon['eid']
+                        && $targetEid <= $this->dragon['eid'] + 7) {
+                        $heldD = $c->inventory[36 + $c->heldSlot] ?? null;
+                        $dmgD = $heldD === null ? 1 : (self::WEAPON_DAMAGE[(int) $heldD['id']] ?? 1);
+                        $this->hurtDragon($dmgD);
+                        $this->addExhaustion($c, 0.3);
+                        break;
+                    }
+                    // 打末影水晶：炸掉 + 周围掉血
+                    if (isset($this->endCrystals[$targetEid])) {
+                        $this->destroyEndCrystal($targetEid);
+                        break;
+                    }
+                    // 打盔甲架：销毁 + 掉一个架
+                    if (isset($this->armorStands[$targetEid])) {
+                        [$asx, $asy, $asz] = $this->armorStands[$targetEid];
+                        unset($this->armorStands[$targetEid]);
+                        foreach ($this->players() as $pp) {
+                            $pp->send(self::C_DESTROY_ENTITIES, (new Writer())
+                                ->varInt(1)->varInt($targetEid));
+                        }
+                        $this->spawnDrop($asx, $asy, $asz, 416, 1, 0, $c);
+                        $this->saveEntities();
+                        $this->log("  打掉盔甲架 eid={$targetEid}");
+                        break;
+                    }
+                    // 打我们自己生成的实体（展示框/盔甲架）：销毁 + 掉落
+                    if (isset($this->spawnedEntities[$targetEid])) {
+                        $ent = $this->spawnedEntities[$targetEid];
+                        unset($this->spawnedEntities[$targetEid]);
+                        foreach ($this->players() as $pp) {
+                            $pp->send(self::C_DESTROY_ENTITIES, (new Writer())
+                                ->varInt(1)->varInt($targetEid));
+                        }
+                        $dropId = match ($ent['type']) {
+                            71 => 389,   // 展示框
+                            30 => 416,   // 盔甲架
+                            default => 0,
+                        };
+                        if ($dropId > 0) {
+                            $this->spawnDrop((int) floor($ent['x']), (int) floor($ent['y']),
+                                (int) floor($ent['z']), $dropId, 1, 0, $c);
+                        }
+                        $this->log("  打掉实体 type={$ent['type']} eid={$targetEid}");
+                        break;
+                    }
+                    // 先看是不是打到了生物
+                    $heldAttack = $c->inventory[36 + $c->heldSlot] ?? null;
+                    $atkDamage = $heldAttack === null
+                        ? 1
+                        : (self::WEAPON_DAMAGE[(int) $heldAttack['id']] ?? 1);
+                    // 附魔加成：锋利每级 +1.25，亡灵杀手/节肢杀手对特定生物 +2.5
+                    if ($heldAttack !== null && !empty($heldAttack['ench'])) {
+                        $mobType = $this->mobs[$targetEid]['type'] ?? 0;
+                        foreach ($heldAttack['ench'] as $ench) {
+                            $eid2 = (int) $ench['id'];
+                            $elv = (int) $ench['lvl'];
+                            if ($eid2 === 16) {
+                                $atkDamage += (int) round($elv * 1.25);
+                            } elseif ($eid2 === 17 && in_array($mobType, [54, 51, 57], true)) {
+                                $atkDamage += (int) round($elv * 2.5);
+                            } elseif ($eid2 === 18 && $mobType === 52) {
+                                $atkDamage += (int) round($elv * 2.5);
+                            }
+                        }
+                    }
+                    $this->log(sprintf('  攻击 eid=%d 伤害=%d 手持=%s',
+                        $targetEid, $atkDamage,
+                        $heldAttack === null ? '空手' : $heldAttack['id'] . '/' . ($heldAttack['damage'] ?? 0)));
+                    if ($this->damageMob($targetEid, $atkDamage, $c)) {
+                        $this->addExhaustion($c, 0.3);
+                        // 武器耐久（含耐久附魔 34）
+                        if ($c->gamemode !== 1 && is_array($heldAttack)
+                            && isset(self::TOOL_MAX[$heldAttack['id']])
+                            && $this->shouldConsumeDurability($heldAttack)) {
+                            $ws = 36 + $c->heldSlot;
+                            $heldAttack['damage'] = (int) ($heldAttack['damage'] ?? 0) + 1;
+                            if ($heldAttack['damage'] >= self::TOOL_MAX[$heldAttack['id']]) {
+                                unset($c->inventory[$ws]);
+                                $this->sendInventorySlot($c, $ws, null);
+                            } else {
+                                $c->inventory[$ws] = $heldAttack;
+                                $this->sendInventorySlot($c, $ws, $heldAttack);
+                            }
+                        }
+                        break;
+                    }
+                    foreach ($this->players() as $other) {
+                        if ($other !== $c && $other->entityId === $targetEid) {
+                            $this->damage($other, max(1, $atkDamage)); // 玩家互打也吃武器伤害
+                            $this->addExhaustion($c, 0.3);
+                            break;
+                        }
+                    }
+                }
+                break;
+
+            case 0x0E: // Click Window
+                // 1.8 顺序：windowId, slot, button, action(short), mode, 手上物品
+                $windowId = $r->readByte();
+                $slot = $r->readShort();
+                $button = $r->readByte();
+                $action = $r->readShort();
+                $mode = $r->readByte();
+                $cursor = $this->readSlotItem($r);
+                if ($mode !== 5 && $c->dragPhase !== 0) {
+                    $this->resetDrag($c);
+                }
+                if ($mode === 5) {
+                    // 工作台(2) 和背包(0) 的拖动恢复 —— 拆分堆叠全靠它。
+                    // 容器（箱子/熔炉/末影箱）仍然禁用：那几个窗口的拖动
+                    // 之前会吞物品，还没查清。
+                    if ($windowId === 2 || $windowId === 0) {
+                        $this->handleDrag($c, $windowId, $slot, $button);
+                    } else {
+                        $this->resetDrag($c);
+                        if ($slot === -999 && $c->cursor !== null) {
+                            $this->returnCursor($c);
+                        }
+                    }
+                } elseif ($windowId === 2) {
+                    $this->clickWorkbench($c, $slot, $button, $mode, $cursor);
+                } elseif ($windowId === 0 && $mode === 4) {
+                    if ($c->cursor !== null) {
+                        $this->dropCursorItem($c, $button === 1);
+                    } else {
+                        $this->dropFromSlot($c, $slot, $button === 1);
+                    }
+                } elseif ($windowId === 0) {
+                    $this->clickInventory($c, $slot, $button, $mode, $cursor);
+                } elseif ($c->enchantTable !== null && $windowId === 1) {
+                    $this->clickEnchant($c, $slot, $button, $mode, $cursor);
+                } elseif ($c->brewing !== null && $windowId === 5) {
+                    $this->clickBrewing($c, $slot, $button, $mode, $cursor);
+                } elseif ($c->anvil !== null) {
+                    $this->clickAnvil($c, $slot, $button, $mode, $cursor);
+                } elseif ($c->furnace !== null && ($windowId === 1 || $windowId === 2 || $windowId === 3)) {
+                    $this->clickFurnace($c, $slot, $button, $mode, $cursor);
+                } elseif ($windowId === 1) {
+                    $this->clickChest($c, $slot, $button, $mode, $cursor);
+                    // 末影箱每次点击后立刻落盘：原来只在「关闭界面」时保存，
+                    // 玩家直接退出游戏（或服务端重启）就丢数据，
+                    // 表现就是「第二次进服东西没了」。
+                    if (!empty($c->chest['ender'])) {
+                        $this->saveEnderSlots(
+                            (string) ($c->chest['owner'] ?? ''),
+                            array_slice($c->chest['slots'] ?? [], 0, 27)
+                        );
+                    }
+                }
+                // 每次真正改变槽位后整窗覆盖一次，客户端本地预测错了也会被纠正，
+                // 不会出现「Shift 出一堆」「合成完又消失」这种分叉。
+                if (($mode === 5 && ($button & 3) === 2) || $mode !== 5) {
+                    $this->sendFullWindow($c);
+                    $this->sendCursor($c);
+                }
+                $c->send(self::C_CONFIRM_TRANSACTION, (new Writer())
+                    ->byte($windowId)->short($action)->bool(true));
+                break;
+
+            case 0x0D: // Close Window
+                $windowId = $r->readByte();
+                $snapBefore = json_encode($c->inventory[40] ?? null);
+                $this->resetDrag($c);
+                if ($c->anvil !== null) {
+                    $this->closeAnvil($c);
+                } elseif ($windowId === 3) {
+                    $this->closeFurnace($c);
+                } elseif ($windowId === 2) {
+                    $this->closeWorkbench($c);
+                } else {
+                    $this->closeChest($c);
+                    $this->returnCraftGrid($c);
+                }
+                $this->returnCursor($c);
+                $this->sendPlayerInventory($c);
+                $snapAfter = json_encode($c->inventory[40] ?? null);
+                if ($snapBefore !== $snapAfter) {
+                    $this->log("  [0x0D] 关窗口 {$windowId} 把槽40 改成了：{$snapBefore} -> {$snapAfter}");
+                }
+                break;
+
+            case 0x12: // Update Sign（客户端编辑完告示牌）
+                $sgnPos = $r->readLong();
+                [$sgnX, $sgnY, $sgnZ] = $this->unpackPosition($sgnPos);
+                $sgnLines = [];
+                for ($si = 0; $si < 4; $si++) {
+                    $sgnLines[] = $r->readString(384);
+                }
+                $this->world->setSignText($sgnX, $sgnY, $sgnZ, $sgnLines);
+                foreach ($this->conns as $sp) {
+                    if (!$sp->closed && $sp->username !== '') {
+                        $this->sendSign($sp, $sgnX, $sgnY, $sgnZ, $sgnLines);
+                    }
+                }
+                $this->log(sprintf('  告示牌 %d,%d,%d 写入: %s', $sgnX, $sgnY, $sgnZ,
+                    implode(' | ', array_map(fn($v) => mb_substr($v, 0, 20), $sgnLines))));
+                break;
+
+            case 0x17: // Custom Payload：铁砧改名走 MC|ItemName
+                $channel = $r->readString(20);
+                if ($channel === 'MC|ItemName' && $c->anvil !== null) {
+                    $name = trim($r->rest());
+                    // 1.8 只允许 30 字符以内，且不能是空白
+                    if ($name !== '' && mb_strlen($name) <= 30) {
+                        $c->anvil['name'] = $name;
+                        $this->log("  {$c->username} 铁砧改名: {$name}");
+                        $this->sendAnvilWindow($c);
+                    }
+                }
+                break;
+
+            case 0x0B: // Entity Action（潜行/疾跑）
+                $entAction = $r->readUnsignedByte();
+                if ($entAction === 0 && $c->riding > 0) {   // 0 = 开始潜行 → 下船
+                    foreach ($this->players() as $pp) {
+                        $pp->send(self::C_ATTACH_ENTITY, (new Writer())
+                            ->int($c->entityId)->int(-1)->byte(0));
+                    }
+                    $this->log("  {$c->username} 下船 eid={$c->riding}");
+                    $c->riding = 0;
+                }
+                break;
+
+            case 0x13: // 客户端报能力（比如开始飞）
+                $flags = $r->readUnsignedByte();
+                $c->flying = ($flags & 0x02) !== 0;
+                break;
+
+            case 0x11: // Enchant Item：窗口 id + 按钮序号
+                $r->readByte();
+                $this->doEnchant($c, $r->readByte());
+                break;
+
+            case 0x15: // Client Settings
+                $r->readString(16);
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    /**
+     * 按玩家朝向算放置 meta（原版 onBlockPlacedBy 的逻辑）。
+     * 之前一律用物品的 damage 当 meta，所以原木、楼梯、熔炉全朝一个方向。
+     */
+    private function placeMeta(Connection $c, int $blockId, int $itemMeta): int
+    {
+        // 原木：按视线定轴（竖着 0 / 沿 X 是 4 / 沿 Z 是 8）
+        if ($blockId === 17) {
+            if ($c->pitch > 45.0 || $c->pitch < -45.0) {
+                return 0;
+            }
+            $yaw = deg2rad($c->yaw);
+
+            return abs(sin($yaw)) > abs(cos($yaw)) ? 4 : 8;
+        }
+
+        // 朝向类方块：i = 0 南 / 1 西 / 2 北 / 3 东
+        $i = ((int) floor(fmod($c->yaw, 360.0) / 90.0 + 0.5)) & 3;
+        // 楼梯：面朝玩家（南3 西4 北2 东5 → 取反）
+        $stairs = [2 => 5, 3 => 4, 4 => 2, 5 => 3];
+        $stairIds = [53, 67, 108, 109, 114, 128, 134, 135, 136, 156, 163, 164, 180, 203];
+
+        if (in_array($blockId, $stairIds, true)) {
+            // 原版楼梯 meta = 朝向对面 + 是否倒置(0x4)
+            $facing = [3, 4, 2, 5][$i];
+
+            return ($stairs[$facing] ?? 2) & 0x3;
+        }
+
+        return $itemMeta;
+    }
+
+    private function changeBlock(int $x, int $y, int $z, int $id, int $meta): void
+    {
+        if ($y < 0 || $y > 255) {
+            return;
+        }
+        $chunk = $this->world->chunk($x >> 4, $z >> 4);
+        $existing = $chunk->blockState($x & 15, $y, $z & 15);
+        if ($id !== 0 && $existing !== 0 && !self::isReplaceable($existing >> 4)) {
+            // 客户端已经先把方块画上去了。这里必须把服务端的真实方块打回去，
+            // 否则客户端会一直留一块幽灵方块，右键它只会继续发放置包。
+            $this->broadcastBlockChange($x, $y, $z, $existing);
+            $this->log("  放 方块{$id} @ {$x},{$y},{$z} 被拒：目标被方块" . ($existing >> 4) . ' 占着');
+
+            return; // 目标被实心方块占着，放不进去
+        }
+        if ($existing !== 0) {
+            $this->log("  替换方块 {$existing} @ {$x},{$y},{$z}");
+        }
+        if (!$chunk->setBlock($x & 15, $y, $z & 15, $id, $meta)) {
+            $this->broadcastBlockChange($x, $y, $z, $existing);
+
+            return;
+        }
+
+        // 双生花是两格高：放下半格时自动补上半格，跟原版一样
+        if ($id === 175 && ($meta & 0x8) === 0 && $y < 255) {
+            if ($chunk->setBlock($x & 15, $y + 1, $z & 15, 175, $meta | 0x8)) {
+                $this->broadcastBlockChange($x, $y + 1, $z, (175 << 4) | ($meta | 0x8));
+            }
+        }
+
+        // 邻居更新：让周围连通的红石粉重算强度（放/拆电源、放/拆导线都走这里）
+        $this->updateRedstoneAround($x, $y, $z);
+
+        // 方块物理：支撑检查 + 重力方块（悬空甘蔗、沙砾下落都靠这里）
+        if (!$this->inNeighborUpdate) {
+            $this->inNeighborUpdate = true;
+            try {
+                $this->neighborUpdate($x, $y, $z);
+            } finally {
+                $this->inNeighborUpdate = false;
+            }
+        }
+
+        $this->broadcastBlockChange($x, $y, $z, (($id & 0xFF) << 4) | ($meta & 0x0F));
+        $this->markSection($x, $y, $z);
+
+        if ($id === 54 || $id === 146) {
+            // 新放的箱子要立刻补瓦片实体，否则客户端只有方块、画不出箱子。
+            $this->broadcastTileEntity($x, $y, $z);
+            // 挨着的箱子也要重发一次，客户端才会重新算双箱子模型。
+            foreach ([[1, 0], [-1, 0], [0, 1], [0, -1]] as [$dx, $dz]) {
+                $nx = $x + $dx;
+                $nz = $z + $dz;
+                if (($this->world->chunk($nx >> 4, $nz >> 4)
+                    ->blockState($nx & 15, $y, $nz & 15) >> 4) === 54) {
+                    $this->broadcastTileEntity($nx, $y, $nz);
+                }
+            }
+        }
+    
+        // 作物：登记进生长表
+        if ($this->isGrowable($id)) {
+            $this->registerCrop($x, $y, $z, $id, $meta);
+        } elseif ($existing !== 0 && $this->isGrowable($existing >> 4)) {
+            // 被清掉的是作物 → 必须从生长表注销，否则它会「凭空重新长出来」。
+            // 之前只有玩家手挖会注销，支撑失效掉落走的是 changeBlock，漏了这一步。
+            $this->unregisterCrop($x, $y, $z);
+        }
+
+        // 往水里塞方块（或挖掉水）：让周围的水重新算自己该不该留。
+        // 注意这跟之前删掉的 recedeAround 不是一回事 —— 这里只排队让每一格
+        // 自己重算，不做半径扫描，不会误伤整片水。
+        if ($existing !== 0 && in_array($existing >> 4, [8, 9, 10, 11], true)
+            && !in_array($id, [8, 9, 10, 11], true)) {
+            $this->notifyFluidNeighbors($x, $y, $z, ($existing >> 4) >= 10 ? 1 : 0);
+        }
+
+        // 【P0 已停用】往水里塞方块时原本会调 recedeAround()，它会扫半径 8
+        // 把「判断为孤立」的水整片删掉 —— 填一格方块就能让整条河干掉。
+        // 原版的液体是靠自己的计划刻逐个方块重算的，不是区域清理。
+        // 等液体系统重写后再恢复，这里先彻底停掉。
+
+        // 告示牌：放下就建一个空 TE，客户端编辑时才有地方存
+        if ($id === 63 || $id === 68) {
+            $this->world->setSignText($x, $y, $z, ['', '', '', '']);
+        }
+        // 刷怪笼：登记进索引，tick 时才会刷怪
+        if ($id === 52) {
+            $this->registerSpawner($x, $y, $z);
+        }
+    }
+
+    /**
+     * 原版的支撑检查：种植物只能种在对应的方块上。
+     * 甘蔗：下面的方块是草/泥土/沙子，且四邻有水；已经在甘蔗上可以继续叠。
+     * 地狱疣：灵魂沙。小麦/胡萝卜/马铃薯：耕地。
+     */
+    private function canPlaceOn(int $id, int $x, int $y, int $z): bool
+    {
+        if ($y <= 0 || $y > 255) {
+            return false;
+        }
+        $below = $this->world->chunk($x >> 4, $z >> 4)
+            ->blockState($x & 15, $y - 1, $z & 15) >> 4;
+
+        if ($id === 83) {
+            if ($below === 83) {
+                return true;
+            }
+            if (!in_array($below, [2, 3, 12], true)) {
+                return false;
+            }
+            foreach ([[-1, 0], [1, 0], [0, -1], [0, 1]] as [$dx, $dz]) {
+                $wx = $x + $dx;
+                $wz = $z + $dz;
+                $water = $this->world->chunk($wx >> 4, $wz >> 4)
+                    ->blockState($wx & 15, $y - 1, $wz & 15) >> 4;
+                if ($water === 8 || $water === 9) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+        if ($id === 115) {                 // 地狱疣 -> 灵魂沙
+            return $below === 88;
+        }
+        if ($id === 59 || $id === 141 || $id === 142) {  // 作物 -> 耕地
+            return $below === 60;
+        }
+
+        return true;
+    }
+
+    /** 草、花、雪层这些原版可以直接盖掉的方块 */
+    private static function isReplaceable(int $id): bool
+    {
+        // 水/岩浆也算「可替换」：原版往流动水里放方块是直接顶掉水的，
+        // 之前没列进来，放置会被拒 → 客户端把方块又弹回去。
+        return in_array($id, [8, 9, 10, 11, 31, 32, 37, 38, 39, 40, 51, 78, 106, 111, 175], true);
+    }
+
+    /** 打碎方块：广播 + 掉东西 */
+    private function breakBlock(Connection $c, int $x, int $y, int $z): void
+    {
+        if ($y < 0 || $y > 255) {
+            $this->log("  挖掘被拒：y={$y} 越界");
+
+            return;
+        }
+        $chunk = $this->world->chunk($x >> 4, $z >> 4);
+        $state = $chunk->blockState($x & 15, $y, $z & 15);
+        if ($state === 0) {
+            $this->log("  挖掘被拒：({$x},{$y},{$z}) 服务端这边已经是空气");
+
+            return;
+        }
+        $id = $state >> 4;
+        $this->emit('onBlockBreak', $this, $c, $x, $y, $z, $id);
+
+        // 挖矿经验（原版数值）：煤1 青金石3 钻石4 红石3 绿宝石4 石英1
+        $oreXp = [16 => 1, 21 => 3, 56 => 4, 73 => 3, 129 => 4, 153 => 1][$id] ?? 0;
+        if ($oreXp > 0) {
+            $this->spawnXpOrb($x + 0.5, $y + 0.3, $z + 0.5, $oreXp);
+        }
+        $meta = $state & 0x0F;
+        if ($id === 7 && $c->gamemode !== 1) {
+            // 原版基岩 hardness = -1，生存和创造都挖不动。
+            // 但这是私服：地狱上下各几层基岩，创造模式下连看都看不到里面，
+            // 纯粹挡路。所以只对生存模式保留这个限制，创造模式放行。
+            return;
+        }
+
+        // 挖掉方块后，把相邻的水/岩浆叫醒 —— 流体的扩散是队列驱动的，
+        // 自然生成的水从来不在队列里，所以以前挖到海边水也不会流过来。
+        foreach ([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]] as [$dx, $dy, $dz]) {
+            $nx = $x + $dx;
+            $ny = $y + $dy;
+            $nz = $z + $dz;
+            if ($ny < 0 || $ny > 255) {
+                continue;
+            }
+            $nst = $this->world->chunk($nx >> 4, $nz >> 4)
+                ->blockState($nx & 15, $ny, $nz & 15);
+            $nid = $nst >> 4;
+            $nmeta = $nst & 15;
+            if ($nid === 8 || $nid === 9) {
+                $this->startFluid($nx, $ny, $nz, 0, $nmeta);
+            } elseif ($nid === 10 || $nid === 11) {
+                $this->startFluid($nx, $ny, $nz, 1, $nmeta);
+            }
+        }
+
+        if ($id === 61 || $id === 62) {
+            // 打掉熔炉：输入/燃料/产出都要掉出来，不能留在数据格子里
+            $fk = $x . ',' . $y . ',' . $z;
+            $rec = $this->furnaces[$fk] ?? null;
+            if ($rec !== null) {
+                foreach (['in', 'fuel', 'out'] as $slotKey) {
+                    $it = $rec[$slotKey] ?? null;
+                    if (is_array($it) && isset($it['id']) && (int) ($it['count'] ?? 0) > 0) {
+                        $this->spawnDrop($x, $y, $z, (int) $it['id'], (int) $it['count'],
+                            (int) ($it['damage'] ?? 0), $c);
+                    }
+                }
+                $this->removeFurnace($x, $y, $z);
+                $this->log("  熔炉被打掉，内容物已掉落 ({$fk})");
+            }
+        }
+
+        if ($this->isGrowable($id)) {
+            $this->unregisterCrop($x, $y, $z);
+        }
+
+        if ($id === 116) {
+            $this->breakEnchantTable($x, $y, $z, $c);
+        }
+
+        if ($id === 176 || $id === 177) {
+            // 旗帜掉落要带颜色（damage = 颜色），走通用掉落会变成白色。
+            // 必须 return —— 否则下面那段通用掉落还会再掉一次 176/177 方块，
+            // 而 176/177 没有物品形态，玩家捡起来客户端就崩（item=null 的 ItemStack）。
+            $bcol = $this->banners[$x . ',' . $y . ',' . $z] ?? 0;
+            $this->removeBanner($x, $y, $z);
+            // 必须真的把方块换成空气！之前只掉了物品就 return，
+            // 方块还留在世界里，于是一个旗帜能被无限次破坏、无限掉东西。
+            $this->changeBlock($x, $y, $z, 0, 0);
+            $this->spawnDrop($x, $y, $z, 425, 1, (int) $bcol, $c);
+
+            return;
+        }
+
+        if ($id === 26) {
+            // 床是两格：meta 的 0x8 位标记「这是头」，低两位是朝向。
+            // 打掉任意一半，另一半也要一起清 —— 之前只掉脚那一半，
+            // 剩下的枕头悬在半空。
+            $dir = $meta & 3;
+            $off = [[0, 1], [-1, 0], [0, -1], [1, 0]][$dir];
+            $isHead = ($meta & 0x8) !== 0;
+            $ox = $isHead ? -$off[0] : $off[0];
+            $oz = $isHead ? -$off[1] : $off[1];
+            $ox2 = $x + $ox;
+            $oz2 = $z + $oz;
+            $ch2 = $this->world->chunk($ox2 >> 4, $oz2 >> 4);
+            if (($ch2->blockState($ox2 & 15, $y, $oz2 & 15) >> 4) === 26) {
+                $ch2->setBlock($ox2 & 15, $y, $oz2 & 15, 0, 0);
+                $this->broadcastBlockChange($ox2, $y, $oz2, 0);
+            }
+        }
+
+        if ($id === 175) {
+            // 双生花是两格高：meta 0-7 是下半，8-15 是上半。
+            // 打任意一半都要把另一半一起清掉，否则会剩半截悬空。
+            $lower = ($meta & 0x8) !== 0 ? $y - 1 : $y;
+            $upper = $lower + 1;
+            foreach ([$lower, $upper] as $yy) {
+                if ($chunk->blockState($x & 15, $yy, $z & 15) >> 4 === 175) {
+                    $chunk->setBlock($x & 15, $yy, $z & 15, 0, 0);
+                    $this->broadcastBlockChange($x, $yy, $z, 0);
+                }
+            }
+            [$dropId, $count] = [175, 1];
+            if ($c->gamemode !== 1) {
+                $this->spawnDrop($x, $lower, $z, $dropId, $count, $meta & 0x7, $c);
+            }
+
+            return;
+        }
+
+        if ($id === 47 && $this->chests->has($x, $y, $z)) {
+            // 书架容器：内容和箱子一样掉出来
+            foreach ($this->chests->load($x, $y, $z) as $item) {
+                if ($item !== null && $item['count'] > 0) {
+                    $this->spawnDrop($x, $y, $z, $item['id'], $item['count'], $item['damage'], $c);
+                }
+            }
+            $this->chests->remove($x, $y, $z);
+        }
+
+        if ($id === 54 || $id === 146) {
+            // 原版 BlockChest.breakBlock：内容全掉出来，再删掉 TileEntity。
+            // 双箱子只掉被打掉的那半边，另一半保留。
+            $this->breakChestBlock($c, $x, $y, $z);
+        }
+
+        $this->addExhaustion($c, 0.005);   // 挖一块 0.005（原版数值）
+
+        // 工具磨损：不扣的话服务端那份永远是满耐久，
+        // 一打开容器整窗覆盖，客户端就会「耐久忽然回满」。
+        // 耐久附魔（34）：1/(level+1) 概率才真扣。
+        if ($c->gamemode !== 1) {
+            $heldSlot = 36 + $c->heldSlot;
+            $held = $c->inventory[$heldSlot] ?? null;
+            if ($held !== null && isset(self::TOOL_MAX[$held['id']]) && $this->shouldConsumeDurability($held)) {
+                $held['damage'] = ($held['damage'] ?? 0) + 1;
+                if ($held['damage'] >= self::TOOL_MAX[$held['id']]) {
+                    unset($c->inventory[$heldSlot]);
+                    $this->sendInventorySlot($c, $heldSlot, null);
+                } else {
+                    $c->inventory[$heldSlot] = $held;
+                    $this->sendInventorySlot($c, $heldSlot, $held);
+                }
+            }
+        }
+
+        if (!$chunk->setBlock($x & 15, $y, $z & 15, 0, 0)) {
+            return;
+        }
+        $this->broadcastBlockChange($x, $y, $z, 0);
+        $this->markSection($x, $y, $z);
+
+
+        // 破坏方块是直写 chunk 的（不经过 changeBlock），所以这里必须自己触发
+        // 邻居更新 —— 否则上面的沙子不会掉、甘蔗不会跟着掉。
+        if (!$this->inNeighborUpdate) {
+            $this->inNeighborUpdate = true;
+            try {
+                $this->neighborUpdate($x, $y, $z);
+            } finally {
+                $this->inNeighborUpdate = false;
+            }
+        }
+
+        // 创造模式不掉落（原版行为）
+        if ($c->gamemode === 1) {
+            if (! $c->hintedCreativeDrop) {
+                $c->hintedCreativeDrop = true;
+                $this->sendChat($c, [
+                    'text' => '创造模式不掉落（原版行为）。想测掉落用 /gm 0 切生存。',
+                    'color' => 'gray',
+                ], 1);
+            }
+
+            return;
+        }
+
+        [$dropId, $count] = self::dropOf($id, $meta);
+
+        // 精准采集（33）/ 时运（35）
+        $heldTool = $c->inventory[36 + $c->heldSlot] ?? null;
+        $silk = $this->itemEnchLevel($heldTool, 33) > 0;
+        $fortune = $this->itemEnchLevel($heldTool, 35);
+
+        if ($dropId > 0 && $count > 0) {
+            if ($silk) {
+                // 精准采集：原样掉一块，无视时运
+                $this->spawnDrop($x, $y, $z, $id, 1, $meta, $c);
+            } else {
+                // 基础掉落（本服偏慷慨：2~5）；时运对矿石再乘 (1 + 0..lvl)
+                $n = random_int(2, 5);
+                if ($fortune > 0 && in_array($id, [16, 21, 56, 73, 129, 153], true)) {
+                    $n *= 1 + random_int(0, $fortune);
+                }
+                $this->spawnDrop($x, $y, $z, $dropId, $n, $dropId === $id ? $meta : 0, $c);
+            }
+        }
+        foreach (self::extraDrops($id, $meta) as [$extraId, $extraCount]) {
+            $this->spawnDrop($x, $y, $z, $extraId, $extraCount, 0, $c);
+        }
+    }
+
+    /**
+     * 1.8 没有单独的光照包。方块一变，客户端那片光就停在旧数据上，
+     * 于是挖开的洞是黑的。唯一的办法是把这一段重新发一遍（带新光照）。
+     */
+    private function markSection(int $x, int $y, int $z): void
+    {
+        // 什么都不做。发段更新会把我们这份「存档里的旧光照」盖到客户端上，
+        // 客户端本来算对的地方反而被压暗 —— 玩家反馈「挖完反而变黑」就是它。
+        // 光照要真修，得在服务端跑正儿八经的光照传播（见 README 的待办）。
+    }
+
+    /**
+     * 把改过的段补发一次（groundUp=false）。
+     * 1.8 没有单独的光照包，客户端也不会自己重算天空光，
+     * 所以挖开的洞要么全黑、要么靠这一步把新光照送过去。
+     */
+    private function flushSections(): void
+    {
+        // 停用开关：这段代码现在没有任何调用点，留着是为了将来做真正的
+        // 光照传播时接着用。谁要重新启用，先读 markSection 上面那段注释 ——
+        // 拿存档里的旧光照覆盖客户端，会让玩家「挖完反而变黑」。
+        if (!self::ENABLE_SECTION_RESEND) {
+            return;
+        }
+
+        if ($this->dirtySections === []) {
+            return;
+        }
+        $now = microtime(true);
+        $sent = 0;
+        foreach ($this->dirtySections as $key => [$cx, $cz, $sy]) {
+            if (($this->lastSectionPush[$key] ?? 0.0) > $now - 0.12) {
+                continue;
+            }
+            unset($this->dirtySections[$key]);
+            $this->lastSectionPush[$key] = $now;
+
+            $data = $this->world->chunk($cx, $cz)->sectionPayload($sy);
+            if ($data === null) {
+                continue;
+            }
+            $packet = (new Writer())
+                ->int($cx)
+                ->int($cz)
+                ->bool(false)                // 只更新这一段
+                ->short(1 << $sy)
+                ->varInt(strlen($data))
+                ->raw($data);
+            foreach ($this->players() as $p) {
+                $p->send(self::C_CHUNK_DATA, $packet);
+            }
+            if (++$sent >= 4) {
+                break;
+            }
+        }
+    }
+
+    private function broadcastBlockChange(int $x, int $y, int $z, int $state): void
+    {
+        $packet = (new Writer())
+            ->raw($this->packPositionBytes($x, $y, $z))
+            ->varInt($state);
+        foreach ($this->players() as $p) {
+            $p->send(self::C_BLOCK_CHANGE, $packet);
+        }
+    }
+
+    private function move(
+        Connection $c,
+        ?float $x,
+        ?float $y,
+        ?float $z,
+        ?float $yaw,
+        ?float $pitch,
+        bool $onGround
+    ): void {
+        $lastChunkX = $c->x / 16;
+        $lastChunkZ = $c->z / 16;
+        $moved = false;
+        if ($x !== null && ($x !== $c->x || $y !== $c->y || $z !== $c->z)) {
+            $c->x = $x;
+            $c->y = (float) $y;
+            $c->z = $z;
+            $moved = true;
+        }
+        if ($yaw !== null) {
+            $c->yaw = $yaw;
+            $c->pitch = (float) $pitch;
+        }
+
+        // 坐着船：把船挪到玩家位置，并广播传送
+        if ($moved && $c->riding > 0 && isset($this->spawnedEntities[$c->riding])) {
+            $boatEid = $c->riding;
+            // 水面上：吸附水面；陆地上：**保持原来的 y**，不要跟着玩家的脚往下掉
+            $surf = $this->waterSurfaceY((int) floor($c->x), (int) floor($c->z), (int) floor($c->y));
+            $boatY = $surf > 0
+                ? (float) $surf
+                : (float) $this->spawnedEntities[$boatEid]['y'];
+            $this->spawnedEntities[$boatEid]['x'] = $c->x;
+            $this->spawnedEntities[$boatEid]['y'] = $boatY;
+            $this->spawnedEntities[$boatEid]['z'] = $c->z;
+            foreach ($this->players() as $pv) {
+                $pv->send(self::C_ENTITY_TELEPORT, (new Writer())
+                    ->varInt($boatEid)
+                    ->int((int) ($c->x * 32))
+                    ->int((int) ($boatY * 32))
+                    ->int((int) ($c->z * 32))
+                    ->byte(self::angle($c->yaw))->byte(0)->bool(true));
+            }
+        }
+
+        // 跑动和跳跃的饱食度消耗（原版：跑 0.1/格，跳 0.05，冲刺跳 0.2）
+        if ($moved) {
+            $c->lastMoveAt = microtime(true);
+            $dist = sqrt(
+                ($c->x - $c->lastX) ** 2 + ($c->z - $c->lastZ) ** 2
+            );
+            if ($dist > 0.02) {
+                // 原版：走路 0.01/格、疾跑 0.1/格。
+                // 没有专门的疾跑包，用单次位移判断：> 0.25 格/包算跑。
+                $rate = $dist > 0.25 ? 0.1 : 0.01;
+                $this->addExhaustion($c, $dist * $rate);
+            }
+            if ($onGround === false && $c->y > $c->lastY + 0.15) {
+                $this->addExhaustion($c, 0.2);   // 原版普通跳跃 0.2
+            }
+            $c->lastX = $c->x;
+            $c->lastY = $c->y;
+            $c->lastZ = $c->z;
+        }
+
+        // 掉落伤害：离地时记住高度，落地时按 (高度差 - 3) 算。
+        // 原版 EntityPlayer.fall() 是 ceil(距离 - 3)，创造模式不摔伤。
+        if (! $onGround && $moved) {
+            $c->fallFrom = $c->fallFrom < 0 ? $c->y : max($c->fallFrom, $c->y);
+        } elseif ($onGround && $c->fallFrom >= 0) {
+            $fall = $c->fallFrom - $c->y;
+            $c->fallFrom = -1.0;
+
+            // 落水里/岩浆里不摔伤（原版：水里、网里、草堆上都不算摔落）
+            $chunk = $this->world->chunk(((int) floor($c->x)) >> 4, ((int) floor($c->z)) >> 4);
+            $feet = $chunk->blockState(((int) floor($c->x)) & 15, (int) floor($c->y), ((int) floor($c->z)) & 15) >> 4;
+            $inWater = in_array($feet, [8, 9, 10, 11], true);
+
+            if ($fall > 3.0 && !$inWater) {
+                // 摔落保护（2）走 fall 通道；普通保护也算进去
+                $this->damage($c, (int) ceil($fall - 3.0), 'fall');
+            }
+        }
+
+        $c->onGround = $onGround;
+
+        // 换了区块就把视野里缺的补上，不然走远了前面就是虚空
+        $oldKey = ((int) floor($lastChunkX)) . ',' . ((int) floor($lastChunkZ));
+        $newKey = (((int) floor($c->x)) >> 4) . ',' . (((int) floor($c->z)) >> 4);
+        if ($oldKey !== $newKey) {
+            $this->queueChunks($c);
+        }
+
+        foreach ($this->players() as $other) {
+            if ($other === $c) {
+                continue;
+            }
+            if ($moved) {
+                $other->send(self::C_ENTITY_TELEPORT, (new Writer())
+                    ->varInt($c->entityId)
+                    ->int((int) floor($c->x * 32))
+                    ->int((int) floor($c->y * 32))
+                    ->int((int) floor($c->z * 32))
+                    ->byte(self::angle($c->yaw))
+                    ->byte(self::angle($c->pitch))
+                    ->bool($c->onGround));
+            } elseif ($yaw !== null) {
+                $other->send(self::C_ENTITY_LOOK, (new Writer())
+                    ->varInt($c->entityId)
+                    ->byte(self::angle($c->yaw))
+                    ->byte(self::angle($c->pitch))
+                    ->bool($c->onGround));
+            }
+            if ($yaw !== null) {
+                $other->send(self::C_HEAD_LOOK, (new Writer())
+                    ->varInt($c->entityId)
+                    ->byte(self::angle($c->yaw)));
+            }
+        }
+    }
+
+    // ---------------- 掉落物 ----------------
+
+    /** 打碎方块掉什么（1.8 掉落表里常用的那些） */
+    /**
+     * 硬度 0 的方块：一碰就碎。
+     * 原版客户端对这类方块是「按下即完成」，有时只发 status=0 不发 2，
+     * 所以服务端不能死等 status=2 —— 收到 0 就直接碎。
+     */
+    private const INSTANT_BREAK = [
+        6,   // 树苗
+        31,  // 高草
+        32,  // 枯木
+        37,  // 蒲公英
+        38,  // 玫瑰
+        39,  // 棕蘑菇
+        40,  // 红蘑菇
+        50,  // 火把
+        51,  // 火
+        59,  // 作物
+        78,  // 雪层
+        83,  // 甘蔗
+        106, // 藤蔓
+        111, // 睡莲
+        115, // 地狱疣
+        141, // 胡萝卜
+        142, // 马铃薯
+        175, // 双生花
+    ];
+
+    /** 物品 id => 方块 id（1.8 里这几样物品 id 与方块 id 不同） */
+    private const PLACEABLE_ITEM = [
+        323 => 63,   // 告示牌
+        324 => 64,   // 橡木门
+        427 => 193,  // 云杉门
+        428 => 194,  // 白桦门
+        429 => 195,  // 丛林木门
+        430 => 196,  // 金合欢门
+        431 => 197,  // 深色橡木门
+        355 => 26,   // 床
+        379 => 117,  // 酿造台
+        397 => 144,  // 头颅（生物头颅/玩家头颅都是 144）
+        425 => 176,  // 旗帜（站立式 176，挂墙的 177 不单独发物品）
+        295 => 59,   // 小麦种子 -> 作物
+        338 => 83,   // 甘蔗 -> 芦苇
+        372 => 115,  // 地狱疣
+        391 => 141,  // 胡萝卜
+        392 => 142,  // 马铃薯
+    ];
+
+    /**
+     * 方块 id => [掉落物 id, 数量]。没列出来的默认掉自己（大多数建筑方块如此）。
+     * 概率类的（树叶、砂砾、枯木、高草）单独在下面处理。
+     */
+    private const DROPS = [
+        62 => [61, 1],      // 点亮的熔炉 -> 普通熔炉（62 本身没有物品！）
+        26 => [355, 1],     // 床（方块 26，物品是 355）
+        117 => [379, 1],    // 酿造台（方块 117，物品是 379）
+        118 => [380, 1],    // 炼药锅（方块 118，物品是 380）
+        1 => [4, 1],        // 石头 -> 圆石
+        2 => [3, 1],        // 草方块 -> 土
+        12 => [12, 1],      // 沙子
+        13 => [13, 1],      // 砂砾（原版 10% 燧石，先按砂砾）
+        14 => [14, 1],      // 金矿
+        15 => [15, 1],      // 铁矿
+        16 => [263, 1],     // 煤矿 -> 煤炭（不是矿石方块！）
+        56 => [264, 1],     // 钻石矿 -> 钻石
+        129 => [388, 1],    // 绿宝石矿 -> 绿宝石
+        21 => [351, 4],     // 青金石矿 -> 4 个青金石
+        24 => [24, 1],      // 砂岩
+        30 => [287, 1],     // 蜘蛛网 -> 线
+        63 => [323, 1],     // 站立告示牌 -> 告示牌
+        68 => [323, 1],     // 墙上告示牌 -> 告示牌
+        60 => [3, 1],       // 耕地 -> 土
+        73 => [331, 4],     // 红石矿 -> 4 个红石
+        78 => [332, 1],     // 雪层 -> 雪球
+        80 => [80, 1],      // 雪块
+        82 => [337, 4],     // 黏土 -> 4 个黏土球
+        83 => [338, 1],     // 甘蔗（方块 83，物品 338）
+        86 => [86, 1],      // 南瓜
+        89 => [89, 1],      // 萤石
+        91 => [91, 1],      // 南瓜灯
+        103 => [360, 4],    // 西瓜 -> 4 片
+        110 => [3, 1],      // 菌丝 -> 土
+        115 => [115, 1],    // 地狱疣
+        121 => [121, 1],    // 末地石
+        129 => [129, 1],    // 绿宝石矿
+        155 => [155, 1],    // 石英矿
+        159 => [159, 1],    // 染色黏土
+        161 => [161, 1],    // 深色树叶（概率在下面）
+        170 => [170, 1],    // 干草块
+        172 => [172, 1],    // 硬化黏土
+        174 => [174, 1],    // 浮冰
+        179 => [179, 1],    // 红砂岩
+    ];
+
+    /** 打碎后什么都不掉的（水、岩浆、玻璃、冰、刷怪箱…） */
+    private const NO_DROP = [7, 8, 9, 10, 11, 20, 34, 36, 51, 52, 55, 64, 71,
+        75, 79, 90, 93, 94, 95, 96, 102, 119, 120, 122, 132, 140, 144, 149, 150, 160,
+        166, 167];
+
+    /**
+     * 1.8 里「有方块、但没有对应 Item」的 id。
+     * 把这些 id 当物品发给客户端，Item.getItemById() 返回 null，
+     * 客户端塞进背包就 NullPointerException（日志里成片出现）。
+     */
+    private const NO_ITEM = [
+        26, 34, 36, 51, 55, 59, 62, 63, 64, 68, 71, 75,
+        117, 118, 93, 94,
+        104, 105, 132, 143, 144, 149, 150, 176, 177,
+        193, 194, 195, 196, 197,
+    ];
+
+    /**
+     * 客户端物品注册表里到底有没有这个 id。
+     *
+     * 以前用的是启发式（id<=450 且不在 NO_ITEM 里），那个规则不准：
+     * 1.8 有几十个方块「有方块、没物品」（点亮的熔炉 62、酿造台 117、
+     * 旗帜方块 176/177…），掉出去客户端就 NPE。
+     * 现在直接查从客户端反编译出来的真实注册表（ItemIds::VALID）。
+     */
+    private static function hasItem(int $id): bool
+    {
+        return isset(ItemIds::VALID[$id]);
+    }
+
+    /**
+     * 武器/工具的攻击伤害（1.8 数值，空手 = 1）。
+     * 1.8 还没有攻击速度，伤害是固定的。
+     */
+    private const WEAPON_DAMAGE = [
+        // 剑
+        268 => 4, 272 => 5, 267 => 6, 276 => 7, 283 => 4,
+        // 斧
+        271 => 3, 275 => 4, 258 => 5, 279 => 6, 286 => 3,
+        // 镐
+        270 => 2, 274 => 3, 257 => 4, 278 => 5, 285 => 2,
+        // 锹
+        269 => 2, 273 => 3, 256 => 4, 277 => 5, 284 => 2,
+        // 锄头：1.8 里就是 1 点（和空手一样，它不是武器）
+        290 => 1, 291 => 1, 292 => 1, 293 => 1, 294 => 1,
+    ];
+
+    /** 工具 id => 最大耐久。挖方块时扣 1，挖穿了就消失。 */
+    private const TOOL_MAX = [
+        // 木
+        268 => 59, 269 => 59, 270 => 59, 271 => 59, 290 => 59,
+        // 石
+        272 => 131, 273 => 131, 274 => 131, 275 => 131, 291 => 131,
+        // 铁
+        256 => 250, 257 => 250, 258 => 250, 259 => 250, 292 => 250,
+        // 钻石
+        276 => 1561, 277 => 1561, 278 => 1561, 279 => 1561, 293 => 1561,
+        // 金
+        283 => 32, 284 => 32, 285 => 32, 286 => 32, 294 => 32,
+    ];
+
+    private static function dropOf(int $id, int $meta): array
+    {
+        // 作物：方块 id 和物品 id 不同，而且要看 meta（age）决定掉什么
+        if ($id === 59) {
+            // 成熟掉 2~3 个小麦（种子在 extraDrops 里补 1~3）；
+            // 没熟只掉 1 个种子。
+            return $meta >= 7 ? [296, 2 + random_int(0, 1)] : [295, 1];
+        }
+        if ($id === 89) {
+            // 萤石挖掉掉萤石粉（348），不是萤石方块自己
+            return [348, 1];
+        }
+        if ($id === 115) {
+            // 地狱疣：成熟 2~4 个，没成熟 1 个
+            return [372, $meta >= 3 ? 2 + random_int(0, 2) : 1];
+        }
+        if ($id === 141) {
+            // 原版：成熟(age 7) 掉 1 + 0~3 个，没熟掉 1 个
+            return [391, $meta >= 7 ? 1 + random_int(0, 3) : 1];
+        }
+        if ($id === 142) {
+            // 马铃薯同理；原版还有 2% 毒马铃薯，这里按普通土豆算
+            return [392, $meta >= 7 ? 1 + random_int(0, 3) : 1];
+        }
+
+        // 概率类的先处理
+        if ($id === 18 || $id === 161) {
+            // 原版：5% 树苗，0.5% 苹果（只有橡树叶掉苹果）
+            if ($id === 18 && mt_rand(1, 200) === 1) {
+                return [260, 1];
+            }
+
+            return mt_rand(1, 20) === 1 ? [6, 1] : [0, 0];
+        }
+        if ($id === 31) {
+            // 31 是「草类」，靠 meta 区分外观：
+            //   meta 0 = 棕色枯枝（就是玩家眼里的「枯死的灌木」）→ 什么都不掉
+            //   meta 1 = 绿色草丛、meta 2 = 蕨 → 12.5% 掉小麦种子
+            // 之前不看 meta，把枯枝也当草丛，所以「打枯木掉种子」。
+            if (($meta & 0x3) === 0) {
+                return [0, 0];
+            }
+
+            return mt_rand(1, 8) === 1 ? [295, 1] : [0, 0];
+        }
+        if ($id === 32) {                          // 枯木：0~2 根木棍
+            return [280, random_int(0, 2)];
+        }
+        if ($id === 13) {                          // 砂砾：10% 燧石
+            return mt_rand(1, 10) === 1 ? [318, 1] : [13, 1];
+        }
+        if (in_array($id, self::NO_DROP, true)) {
+            return [0, 0];
+        }
+        if (isset(self::DROPS[$id])) {
+            [$did, $dcnt] = self::DROPS[$id];
+            // 兜底：目标 id 没有对应物品时不要掉。
+            // 客户端拿到「item 为 null 的 ItemStack」会在 tick 时 NPE 崩溃，
+            // 而且这个坏物品会存进 playerdata，下次进服立刻再崩。
+            return self::hasItem($did) ? [$did, $dcnt] : [0, 0];
+        }
+
+        if (!self::hasItem($id)) {
+            return [0, 0];   // 没物品形态的方块，掉了也只会让客户端崩
+        }
+
+        // 大多数建筑方块掉自己；但没有物品形态的 id（如 62 点亮的熔炉）
+        // 绝不能掉出去 —— 客户端拿到 item 为 null 的 ItemStack 会 tick 崩溃。
+        return self::hasItem($id) ? [$id, 1] : [0, 0];
+    }
+
+    /**
+     * 主掉落之外额外掉的东西（和原版 getItemDropped / dropBlockAsItemWithChance 对齐）：
+     * 成熟小麦额外掉 0~3 个种子，成熟马铃薯 2% 掉毒马铃薯。
+     *
+     * @return array<int, array{0:int,1:int}> [物品 id, 数量]
+     */
+    private static function extraDrops(int $id, int $meta): array
+    {
+        if ($id === 59 && $meta >= 7) {
+            // 保底 1 个、最多 3 个种子
+            $seeds = 1 + random_int(0, 2);
+
+            return $seeds > 0 ? [[295, $seeds]] : [];
+        }
+        if ($id === 142 && $meta >= 7 && random_int(1, 50) === 1) {
+            return [[394, 1]];
+        }
+
+        return [];
+    }
+
+    /**
+     * 方块打碎掉出来的东西。
+     * 直接复用 throwItem 那条路 —— 「扔出来的」客户端能画出来，「挖出来的」
+     * 画不出来，两边原本是两段几乎一样的发包代码，那就别留两份。
+     */
+    private function spawnDrop(int $x, int $y, int $z, int $id, int $count, int $meta, ?Connection $owner): void
+    {
+        // 落点下面是岩浆的话，丢出来就烧没了 —— 用户反馈「有些地方挖了不掉」。
+        // 这种情况直接塞进挖它的人背包，别跟岩浆赌。
+        if ($owner !== null) {
+            for ($d = 1; $d <= 3; $d++) {
+                $below = $this->blockIdAt($x, $y - $d, $z);
+                if ($below === 10 || $below === 11) {
+                    $this->giveItem($owner, $id, $count, $meta);
+                    $this->log("  {$id}x{$count} 落点是岩浆，直接进 {$owner->username} 背包");
+                    return;
+                }
+                if ($below !== 0) {
+                    break;   // 碰到实心就不用再往下看了
+                }
+            }
+        }
+
+        // 原版：spawnEntityInWorld(new EntityItem(world, x + 0.5, y + 0.5, z + 0.5, stack))
+        $px = $x + 0.5;
+        $py = $y + 0.5;
+        $pz = $z + 0.5;
+
+        $this->throwItem(
+            $px,
+            $py,
+            $pz,
+            $id,
+            $count,
+            $meta,
+            random_int(-900, 900),
+            1600,
+            random_int(-900, 900),
+            0.5
+        );
+
+        $this->log(sprintf(
+            '  掉落 %dx 方块%d @ %d,%d,%d -> 物品 %0.1f,%0.1f,%0.1f',
+            $count,
+            $id,
+            $x,
+            $y,
+            $z,
+            $px,
+            $py,
+            $pz
+        ));
+    }
+
+    /** @var array 玩家名 => 总经验 */
+    /** 饱食度调试：/foodlog 开关，开启后每次消耗/结算都写日志 */
+    private bool $foodDebug = false;
+
+    /**
+     * 通用调试开关（/debug）。
+     * 【项目约定】以后每加一个功能，都在关键分支留一行 if ($this->debugLog) 的日志，
+     * 排查时用 /debug 一开就有，不用临时加代码再重启。
+     */
+    private bool $debugLog = false;
+
+    /** 邻居更新递归保护（changeBlock → neighborUpdate → changeBlock） */
+    private bool $inNeighborUpdate = false;
+
+    /** 正在吃的东西：itemId + 吃完的时刻（原版要等 1.6 秒） */
+    private static function eatDuration(): float
+    {
+        return 1.6;
+    }
+
+    /** 世界规则 naturalRegeneration，1.8 默认 true */
+    private bool $naturalRegen = true;
+
+    private array $xpStore = [];
+    private bool $xpLoaded = false;
+
+    private function xpFile(): string
+    {
+        return dirname(__DIR__) . DIRECTORY_SEPARATOR . 'cache' . DIRECTORY_SEPARATOR . 'xp.json';
+    }
+
+    private function loadXpStore(): void
+    {
+        if ($this->xpLoaded) {
+            return;
+        }
+        $this->xpLoaded = true;
+        $f = $this->xpFile();
+        if (is_file($f)) {
+            $j = json_decode((string) @file_get_contents($f), true);
+            if (is_array($j)) {
+                $this->xpStore = $j;
+            }
+        }
+    }
+
+    private float $lastOrbTick = 0.0;
+
+    /** @var array 经验球 eid => [x,y,z,amount] */
+    private array $xpOrbs = [];
+
+    /** 生成经验球（实体 type=2）。远处的经验也能走过去捡。 */
+    private function saveXpStore(): void
+    {
+        $dir = dirname($this->xpFile());
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0777, true);
+        }
+        @file_put_contents($this->xpFile(), json_encode($this->xpStore), LOCK_EX);
+    }
+
+    private function spawnXpOrb(float $x, float $y, float $z, int $amount): void
+    {
+        if ($amount <= 0) {
+            return;
+        }
+        $eid = $this->nextEntityId++;
+        $this->xpOrbs[$eid] = [$x, $y + 0.25, $z, $amount];
+        foreach ($this->players() as $p) {
+            // 经验球有独立的包 0x11（不是 Spawn Object）：
+            // eid + x/y/z(*32) + 经验值(short)
+            $p->send(self::C_SPAWN_XP_ORB, (new Writer())
+                ->varInt($eid)
+                ->int((int) ($x * 32))->int((int) ($y * 32))->int((int) ($z * 32))
+                ->short($amount));
+        }
+    }
+
+    /**
+     * 经验球：服务端自己吸附 + 拾取。
+     * 以前只有客户端在「视觉上」吸过去，服务端把球留在原地，
+     * 于是看着被吸走了、球却永远不消失。
+     * 原版 EntityXPOrb.onUpdate 就是每 tick 朝最近的玩家挪一点。
+     */
+    private function tickXpOrbs(float $now = 0.0): void
+    {
+        if ($this->xpOrbs === []) {
+            return;
+        }
+        // 主循环一秒上千次，不限速的话球会瞬间飞到身上（看不见过程）
+        if ($now - $this->lastOrbTick < 0.05) {
+            return;
+        }
+        $this->lastOrbTick = $now;
+        foreach ($this->xpOrbs as $eid => [$ox, $oy, $oz, $amt]) {
+            // 找最近的玩家（8 格内才开始吸）
+            $best = null;
+            $bestD = 8.0;
+            foreach ($this->players() as $p) {
+                $d = sqrt(($p->x - $ox) ** 2 + ($p->y + 0.9 - $oy) ** 2 + ($p->z - $oz) ** 2);
+                if ($d < $bestD) {
+                    $bestD = $d;
+                    $best = $p;
+                }
+            }
+            if ($best === null) {
+                continue;
+            }
+
+            if ($bestD <= 1.2) {
+                // 收到包里
+                unset($this->xpOrbs[$eid]);
+                foreach ($this->players() as $q) {
+                    $q->send(self::C_DESTROY_ENTITIES, (new Writer())->varInt(1)->varInt($eid));
+                }
+                $this->giveExp($best, $amt);
+
+                continue;
+            }
+
+            // 朝玩家挪 0.35 格（原版大约这个速度）
+            $step = min(0.35, $bestD);
+            $ox += ($best->x - $ox) / $bestD * $step;
+            $oy += ($best->y + 0.9 - $oy) / $bestD * $step;
+            $oz += ($best->z - $oz) / $bestD * $step;
+            $this->xpOrbs[$eid] = [$ox, $oy, $oz, $amt];
+
+            foreach ($this->players() as $q) {
+                $q->send(self::C_ENTITY_TELEPORT, (new Writer())
+                    ->varInt($eid)
+                    ->int((int) ($ox * 32))->int((int) ($oy * 32))->int((int) ($oz * 32))
+                    ->byte(0)->byte(0)->bool(false));
+            }
+        }
+    }
+
+    private function processDrops(): void
+    {
+        if ($this->drops === []) {
+            return;
+        }
+        $now = microtime(true);
+        foreach ($this->drops as $eid => $d) {
+            // 简易物理：按 20 次/秒推进，往下掉、碰到方块就停。
+            // 不模拟的话，服务器只知道东西「出生在哪」，刚扔出去就会被判成
+            // 还在脚边，于是立刻又被捡回来。
+            if (isset($d['vx'])) {
+                $frames = (int) (($now - $d['step']) / 0.05);
+                if ($frames > 0) {
+                    $frames = min($frames, 5);
+                    $dead = false;
+                    for ($f = 0; $f < $frames; $f++) {
+                        // 阻力 + 重力
+                        $d['vx'] = (int) ($d['vx'] * 0.98);
+                        $d['vy'] = (int) (($d['vy'] - 320) * 0.98);   // 原版 this.w -= 0.04f，0.04*8000=320
+                        $d['vz'] = (int) ($d['vz'] * 0.98);
+
+                        $mx = $d['vx'] / 8000;
+                        $my = $d['vy'] / 8000;
+                        $mz = $d['vz'] / 8000;
+
+                        // 一帧最多挪 0.4 格，再远就拆成几小步。
+                        // 不拆的话，一步从地面上方跨到地下空洞里，中间的方块被跳过 ——
+                        // 东西就这么穿地掉下去了（日志里 89.1 → 78.5 就是这么来的）。
+                        $far = max(abs($mx), abs($my), abs($mz));
+                        $sub = max(1, (int) ceil($far / 0.4));
+                        $hit = false;
+                        for ($s = 0; $s < $sub; $s++) {
+                            $nx = $d['x'] + $mx / $sub;
+                            $ny = $d['y'] + $my / $sub;
+                            $nz = $d['z'] + $mz / $sub;
+                            if ($this->solidAt($nx, $ny - 0.02, $nz)) {
+                                $hit = true;
+                                break;
+                            }
+                            $d['x'] = $nx;
+                            $d['y'] = $ny;
+                            $d['z'] = $nz;
+                        }
+                        if ($hit) {
+                            $d['vx'] = $d['vy'] = $d['vz'] = 0;
+                            break;
+                        }
+                        if ($d['y'] < -5) {
+                            $dead = true;
+                            break;
+                        }
+                    }
+                    if ($dead) {
+                        unset($this->drops[$eid]);
+                        continue;
+                    }
+                    $d['step'] = $now;
+                    $this->drops[$eid] = $d;
+                }
+            }
+
+            // 服务端的简易物理和客户端的碰撞不完全一样，定期把真实位置打回去，
+            // 否则客户端画在 A、服务端在 B，站得很近也捡不到。
+            if (!isset($d['lastSync']) || $now - $d['lastSync'] >= 0.5) {
+                foreach ($this->players() as $p) {
+                    $p->send(self::C_ENTITY_TELEPORT, (new Writer())
+                        ->varInt($eid)
+                        ->int((int) ($d['x'] * 32))
+                        ->int((int) ($d['y'] * 32))
+                        ->int((int) ($d['z'] * 32))
+                        ->byte(0)->byte(0)->bool(true));
+                }
+                $d['lastSync'] = $now;
+                $this->drops[$eid] = $d;
+            }
+
+            if ($now < $d['at']) {
+                continue;
+            }
+
+            // 没人要就消失，别在地上堆一辈子
+            if ($now > $d['expire']) {
+                foreach ($this->players() as $p) {
+                    $p->send(self::C_DESTROY_ENTITIES, (new Writer())
+                        ->varInt(1)->varInt($eid));
+                }
+                unset($this->drops[$eid]);
+                continue;
+            }
+
+            // 原版是「走过去才捡」，不是掉出来就自动吸 —— 离得远就留在原地
+            $picker = $this->nearestPlayer($d['x'], $d['y'], $d['z'], 1.8);
+            if ($picker === null) {
+                // 只记一次，免得刷屏；用来判断到底是「太远」还是「压根没跑到这」
+                if (!isset($d['logged'])) {
+                    $best = null;
+                    $bestD = PHP_FLOAT_MAX;
+                    foreach ($this->players() as $p) {
+                        $dd = sqrt(
+                            ($p->x - $d['x']) ** 2 + (($p->y + 0.9) - $d['y']) ** 2 + ($p->z - $d['z']) ** 2
+                        );
+                        if ($dd < $bestD) {
+                            $bestD = $dd;
+                            $best = $p;
+                        }
+                    }
+                    $this->log(sprintf(
+                        '  没捡到 eid=%d @ %.1f,%.1f,%.1f | 玩家 %s @ %.1f,%.1f,%.1f dx=%.2f dy=%.2f dz=%.2f',
+                        $eid,
+                        $d['x'],
+                        $d['y'],
+                        $d['z'],
+                        $best?->username ?? '-',
+                        $best?->x ?? 0,
+                        $best?->y ?? 0,
+                        $best?->z ?? 0,
+                        $best === null ? 0 : $best->x - $d['x'],
+                        $best === null ? 0 : ($best->y + 0.9) - $d['y'],
+                        $best === null ? 0 : $best->z - $d['z']
+                    ));
+                    $this->drops[$eid]['logged'] = true;
+                }
+                continue;
+            }
+
+            if (!$this->canGive($picker, $d['id'], $d['count'], $d['meta'])) {
+                if (!isset($d['loggedFull'])) {
+                    $this->log("  背包满，掉落 eid={$eid} 留在地上");
+                    $this->drops[$eid]['loggedFull'] = true;
+                }
+                continue;
+            }
+
+            foreach ($this->players() as $p) {
+                $p->send(self::C_COLLECT_ITEM, (new Writer())
+                    ->varInt($eid)
+                    ->varInt($picker->entityId));
+                // 有的客户端收到 Collect Item 也不会删实体，补一次销毁
+                $p->send(self::C_DESTROY_ENTITIES, (new Writer())
+                    ->varInt(1)->varInt($eid));
+            }
+            $this->giveItem($picker, $d['id'], $d['count'], $d['meta'], $d['extra'] ?? []);
+            $this->log(sprintf(
+                '  捡到 eid=%d 方块%d x%d -> %s',
+                $eid,
+                $d['id'],
+                $d['count'],
+                $picker->username
+            ));
+            unset($this->drops[$eid]);
+        }
+    }
+
+    /** 从某个槽位丢东西：$all=true 是 Ctrl+Q 丢一组 */
+    private function dropFromSlot(Connection $c, int $slot, bool $all): void
+    {
+        $it = $c->inventory[$slot] ?? null;
+        if ($it === null) {
+            return;
+        }
+        $n = $all ? $it['count'] : 1;
+        $left = $it['count'] - $n;
+        if ($left <= 0) {
+            unset($c->inventory[$slot]);
+            $c->send(self::C_SET_SLOT, (new Writer())
+                ->byte(0)->short($slot)->short(-1));
+        } else {
+            $it['count'] = $left;
+            $c->inventory[$slot] = $it;
+            $this->sendSlot($c, $slot, $it);
+        }
+
+        $this->toss($c, $it['id'], $n, $it['damage'],
+            array_diff_key($it, ['id' => 0, 'count' => 0, 'damage' => 0]));
+    }
+
+    /** 朝视线方向扔出一个物品实体，客户端靠 Spawn Object 里的速度画抛物线 */
+    private function toss(Connection $c, int $id, int $count, int $damage, array $extra = []): void
+    {
+        $yaw = deg2rad($c->yaw);
+        $pitch = deg2rad($c->pitch);
+        $dx = -sin($yaw) * cos($pitch);
+        $dy = -sin($pitch);
+        $dz = cos($yaw) * cos($pitch);
+        $px = $c->x + $dx * 0.3;
+        $py = $c->y + 1.3 + $dy * 0.3;
+        $pz = $c->z + $dz * 0.3;
+
+        $this->throwItem($px, $py, $pz, $id, $count, $damage,
+            (int) ($dx * 2400), (int) ($dy * 2400 + 600), (int) ($dz * 2400), 2.0, $extra);
+    }
+
+    /** 背包界面里 Q 键：光标上拿着东西时从光标丢 */
+    private function dropCursorItem(Connection $c, bool $all): void
+    {
+        if ($c->cursor === null) {
+            return;
+        }
+        $it = $c->cursor;
+        $n = $all ? $it['count'] : 1;
+        $left = $it['count'] - $n;
+        $c->cursor = $left > 0
+            ? ['id' => $it['id'], 'count' => $left, 'damage' => $it['damage']]
+            : null;
+        $this->sendCursor($c);
+        $this->toss($c, $it['id'], $n, $it['damage']);
+    }
+
+    /** 给某一个玩家补发一条掉落实体（进服时用，带服务端当前速度）。 */
+    private function sendDropSpawn(Connection $p, int $eid, array $d): void
+    {
+        if (($d['id'] ?? 0) <= 0 || ($d['count'] ?? 0) <= 0) {
+            return;
+        }
+
+        $p->send(self::C_SPAWN_OBJECT, (new Writer())
+            ->varInt($eid)
+            ->byte(2)
+            ->int((int) ($d['x'] * 32))
+            ->int((int) ($d['y'] * 32))
+            ->int((int) ($d['z'] * 32))
+            ->byte(0)->byte(0)
+            ->int(1)
+            ->short((int) ($d['vx'] ?? 0))
+            ->short((int) ($d['vy'] ?? 0))
+            ->short((int) ($d['vz'] ?? 0)));
+        $p->send(self::C_ENTITY_METADATA, (new Writer())
+            ->varInt($eid)
+            ->byte((5 << 5) | 10)
+            ->raw($this->slotBytes([
+                'id' => $d['id'],
+                'count' => $d['count'],
+                'damage' => $d['meta'],
+            ] + ($d['extra'] ?? [])))
+            ->unsignedByte(0x7F));
+    }
+
+    /** 在指定位置放一个物品实体，速度和坐标都由调用方给。 */
+    private function throwItem(
+        float $px,
+        float $py,
+        float $pz,
+        int $id,
+        int $count,
+        int $meta,
+        int $vx,
+        int $vy,
+        int $vz,
+        float $delay = 2.0,
+        array $extra = []
+    ): void {
+        // 兜底：id 非法或数量为 0 的物品实体，客户端拿到会渲染空栈 → NPE 崩溃
+        // （报错是「实体 null 导致崩溃」）。宁可不生成，也不能让客户端炸。
+        if (!self::hasItem($id) || $count <= 0) {
+            return;
+        }
+        $count = min(64, $count);
+
+        $eid = $this->nextEntityId++;
+
+        $n = 0;
+        foreach ($this->players() as $p) {
+            $n++;
+            $p->send(self::C_SPAWN_OBJECT, (new Writer())
+                ->varInt($eid)
+                ->byte(2)
+                ->int((int) ($px * 32))
+                ->int((int) ($py * 32))
+                ->int((int) ($pz * 32))
+                ->byte(0)->byte(0)
+                // 1.8 的 Spawn Object 只有在 data>0 时才带速度三个 short。
+                // data=0 会让客户端把物品钉在出生点，之后服务端自己算的抛物线
+                // 客户端完全看不到，所以捡东西时位置对不上。
+                ->int(1)
+                ->short($vx)->short($vy)->short($vz));
+            // 用 slotBytes 拼物品栈：它会把 ench / display.Name 一起写进 NBT。
+            // 之前这里写死 byte(0)，丢出去的附魔装备就是白板。
+            $p->send(self::C_ENTITY_METADATA, (new Writer())
+                ->varInt($eid)
+                ->byte((5 << 5) | 10)
+                ->raw($this->slotBytes(['id' => $id, 'count' => $count, 'damage' => $meta] + $extra))
+                ->unsignedByte(0x7F));
+        }
+
+        $now = microtime(true);
+        $this->drops[$eid] = [
+            'id' => $id,
+            'count' => $count,
+            'meta' => $meta,
+            'extra' => $extra,
+            'x' => $px,
+            'y' => $py,
+            'z' => $pz,
+            'vx' => $vx,
+            'vy' => $vy,
+            'vz' => $vz,
+            'step' => $now,
+            'at' => $now + $delay,
+            'expire' => $now + 30,
+        ];
+        $this->log("  丢出 {$count}x 方块{$id} eid={$eid} @ " . round($px, 1) . ',' . round($py, 1) . ',' . round($pz, 1) . " 发给了 {$n} 人");
+    }
+
+    private function solidAt(float $x, float $y, float $z): bool
+    {
+        if ($y < 0 || $y > 255) {
+            return false;
+        }
+        $bx = (int) floor($x);
+        $by = (int) floor($y);
+        $bz = (int) floor($z);
+
+        return $this->world->chunk($bx >> 4, $bz >> 4)->blockState($bx & 15, $by, $bz & 15) !== 0;
+    }
+
+    private function nearestPlayer(float $x, float $y, float $z, float $radius): ?Connection
+    {
+        // 原版不是算球形距离，而是「玩家碰撞箱往外扩 (1.0, 0.5, 1.0) 再判相交」。
+        // 玩家碰撞箱半宽 0.3、高 1.8，所以横向约 ±1.3、纵向从脚底 -0.6 到头顶 +2.0。
+        // 用盒子比球更好捡，也更接近原版。
+        $best = null;
+        $bestDist = PHP_FLOAT_MAX;
+        foreach ($this->players() as $p) {
+            if (abs($p->x - $x) > 1.3 || abs($p->z - $z) > 1.3) {
+                continue;
+            }
+            if ($y < $p->y - 0.6 || $y > $p->y + 2.0) {
+                continue;
+            }
+            $dist = abs($p->x - $x) + abs($p->z - $z);
+            if ($dist < $bestDist) {
+                $bestDist = $dist;
+                $best = $p;
+            }
+        }
+
+        return $best;
+    }
+
+    /** 塞进背包：先堆叠，再找空位，每个变化的槽位回一个 Set Slot */
+    /**
+     * 给玩家物品。$extra 用来带附加字段（目前是 ench），
+     * 不带的话合并/新建出来的就是白板 —— 附魔会在这里被抹掉。
+     */
+    private function giveItem(Connection $c, int $id, int $count, int $damage, array $extra = []): void
+    {
+        // 探针：谁在给物品、给的是什么（用来抓「附魔被重建」的现场）
+        $bt = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 3);
+        $this->log(sprintf('  [giveItem] %d x%d 来自 %s%s',
+            $id, $count, $bt[1]['function'] ?? '?',
+            $extra === [] ? '' : ' extra=' . json_encode($extra)));
+        $slots = array_merge(range(36, 44), range(9, 35));
+
+        foreach ($slots as $slot) {
+            $it = $c->inventory[$slot] ?? null;
+            if ($it === null || $it['id'] !== $id || $it['damage'] !== $damage
+                || $it['count'] >= self::maxStack($id)) {
+                continue;
+            }
+            $add = min(self::maxStack($id) - $it['count'], $count);
+            $it['count'] += $add;
+            $count -= $add;
+            $c->inventory[$slot] = $it;
+            $this->sendInventorySlot($c, $slot, $it);
+            if ($count <= 0) {
+                return;
+            }
+        }
+
+        foreach ($slots as $slot) {
+            if (isset($c->inventory[$slot])) {
+                continue;
+            }
+            $it = ['id' => $id, 'count' => min(self::maxStack($id), $count), 'damage' => $damage] + $extra;
+            $c->inventory[$slot] = $it;
+            $count -= $it['count'];
+            $this->sendInventorySlot($c, $slot, $it);
+            if ($count <= 0) {
+                return;
+            }
+        }
+    }
+
+    /** 背包里还能放多少个指定物品 */
+    private function giveSpace(Connection $c, int $id, int $damage): int
+    {
+        $slots = array_merge(range(36, 44), range(9, 35));
+        $space = 0;
+        foreach ($slots as $slot) {
+            $it = $c->inventory[$slot] ?? null;
+            if ($it === null) {
+                $space += self::maxStack($id);
+            } elseif ($it['id'] === $id && $it['damage'] === $damage) {
+                $space += max(0, self::maxStack($id) - $it['count']);
+            }
+        }
+
+        return $space;
+    }
+
+    /** 背包里是否放得下这么多（用于合成输出/拾取，放不下就别消耗/别捡） */
+    private function canGive(Connection $c, int $id, int $count, int $damage): bool
+    {
+        return $this->giveSpace($c, $id, $damage) >= $count;
+    }
+
+    private function sendSlot(Connection $c, int $slot, array $it): void
+    {
+        $c->send(self::C_SET_SLOT, (new Writer())
+            ->byte(0)
+            ->short($slot)
+            ->short($it['id'])
+            ->byte($it['count'])
+            ->short($it['damage'])
+            ->byte(0));
+    }
+
+    // ---------------- 命令 ----------------
+
+    private function command(Connection $c, string $line): void
+    {
+        $parts = preg_split('/\s+/', trim($line)) ?: [];
+        $cmd = strtolower(ltrim(array_shift($parts) ?? '', '/'));
+        $arg = strtolower($parts[0] ?? '');
+
+        switch ($cmd) {
+            case 'help':
+                $this->sendChat($c, ['text' => '可用命令：', 'color' => 'yellow'], 1);
+                $this->sendChat($c, ['text' => '/gm <0|1|2|3>  切换模式（0 生存 / 1 创造）', 'color' => 'gray'], 1);
+                $this->sendChat($c, ['text' => '/spawn  回到出生点', 'color' => 'gray'], 1);
+                $this->sendChat($c, ['text' => '/nether  直接进/出地狱（测试用）', 'color' => 'gray'], 1);
+                $this->sendChat($c, ['text' => '/who  看看谁在线', 'color' => 'gray'], 1);
+                $this->sendChat($c, ['text' => '/block x y z  问服务器这个坐标是什么方块', 'color' => 'gray'], 1);
+                $this->sendChat($c, ['text' => '/save  立刻存盘', 'color' => 'gray'], 1);
+                $this->sendChat($c, ['text' => '/reload  丢掉内存缓存、按磁盘重发（验证存盘）', 'color' => 'gray'], 1);
+                break;
+
+            case 'gm':
+            case 'gamemode':
+                $gm = match ($arg) {
+                    '0', 's', 'survival' => 0,
+                    '1', 'c', 'creative' => 1,
+                    '2', 'a', 'adventure' => 2,
+                    '3', 'sp', 'spectator' => 3,
+                    default => -1,
+                };
+                if ($gm < 0) {
+                    $this->sendChat($c, ['text' => '用法：/gm 0|1|2|3', 'color' => 'red'], 1);
+                    break;
+                }
+                $c->gamemode = $gm;
+                $c->flying = false;
+                $c->send(self::C_CHANGE_GAME_STATE, (new Writer())
+                    ->unsignedByte(3)
+                    ->float((float) $gm));
+                $this->sendAbilities($c);
+                foreach ($this->players() as $p) {
+                    $this->sendTabAdd($p, $c);
+                }
+                $this->sendChat($c, [
+                    'text' => '模式已切换：' . self::gameModeName($gm),
+                    'color' => 'green',
+                ], 1);
+                break;
+
+            case 'dragon':
+                // 龙已经在场上就别再发一次 Spawn Mob —— 客户端会同 eid 重建实体，
+                // 看起来就是「龙被重新召唤回出生点了」。
+                if ($this->dragon !== null) {
+                    $this->sendChat($c, ['text' => '末影龙已经在场上了', 'color' => 'gray'], 1);
+                    break;
+                }
+                $this->spawnDragon();
+                $this->sendDragonSpawn($c);
+                $this->sendChat($c, ['text' => '末影龙已生成', 'color' => 'light_purple'], 1);
+                break;
+
+            case 'nether':
+                // 测试用：直接走「进地狱」完整流程（切维度 + 凿入口房间 + 回程门）
+                // 若已在地狱则传回主世界
+                $this->teleportThroughPortal($c);
+                break;
+
+            case 'end':
+                // 末地就在世界坐标 300000,300000，中央岛的平台在 y=65
+                // 基座在 (0,64,0)，落脚平台在基座南边 8 格
+                $c->x = 300000.5;
+                $c->y = 65.0;
+                $c->z = 300008.5;
+                $c->fallFrom = -1.0;
+                $c->send(self::C_POS_LOOK, (new Writer())
+                    ->double($c->x)->double($c->y)->double($c->z)
+                    ->float($c->yaw)->float($c->pitch)->byte(0));
+                $this->sendChat($c, ['text' => '传送到末地中央岛', 'color' => 'light_purple'], 1);
+                break;
+
+            case 'tp':
+                if (count($parts) < 3) {
+                    $this->sendChat($c, ['text' => '用法：/tp x y z', 'color' => 'red'], 1);
+                    break;
+                }
+                $c->x = (float) $parts[0];
+                $c->y = (float) $parts[1];
+                $c->z = (float) $parts[2];
+                $c->send(self::C_POS_LOOK, (new Writer())
+                    ->double($c->x)->double($c->y)->double($c->z)
+                    ->float($c->yaw)->float($c->pitch)->byte(0));
+                $this->sendChat($c, ['text' => sprintf('已传送到 %.1f %.1f %.1f', $c->x, $c->y, $c->z),
+                    'color' => 'green'], 1);
+                $this->log(sprintf('  %s /tp %.1f %.1f %.1f', $c->username, $c->x, $c->y, $c->z));
+                break;
+
+            case 'biome':
+                $bx = (int) floor($c->x);
+                $bz = (int) floor($c->z);
+                $grid = $this->world->chunkBiomes($bx >> 4, $bz >> 4);
+                $id = $grid[($bz & 15) * 16 + ($bx & 15)] ?? -1;
+                $this->sendChat($c, ['text' => sprintf('当前群系：%s (id %d)  区块 %d,%d',
+                    self::biomeName($id), $id, $bx >> 4, $bz >> 4), 'color' => 'aqua'], 1);
+                break;
+
+            case 'findbiome':
+                if (count($parts) < 1 || $parts[0] === '') {
+                    $this->sendChat($c, ['text' => '用法：/findbiome 平原  或  /findbiome 1', 'color' => 'red'], 1);
+                    break;
+                }
+                $want = self::biomeIdByName((string) $parts[0]);
+                if ($want === null) {
+                    $this->sendChat($c, ['text' => '不认识的群系。可用：平原 森林 沙漠 丛林 针叶林 雪原 沼泽 台地 山地',
+                        'color' => 'red'], 1);
+                    break;
+                }
+                $pcx = (int) floor($c->x) >> 4;
+                $pcz = (int) floor($c->z) >> 4;
+                // 一次算一大片再扫，比逐区块快几十倍（逐区块 441 次要 20 秒）
+                $r = 10;
+                $bx = ($pcx - $r) * 16;
+                $bz = ($pcz - $r) * 16;
+                $side = ($r * 2 + 1) * 16;
+                $grid = $this->world->biomeArea($bx, $bz, $side, $side);
+                $found = null;
+                $bestD = PHP_INT_MAX;
+                for ($i = 0; $i < $side * $side; $i++) {
+                    if (($grid[$i] ?? -1) !== $want) {
+                        continue;
+                    }
+                    $gx = $bx + ($i % $side);
+                    $gz = $bz + intdiv($i, $side);
+                    $d = max(abs($gx - (int) $c->x), abs($gz - (int) $c->z));
+                    if ($d < $bestD) {
+                        $bestD = $d;
+                        // 记具体那一格（方块坐标），不是区块中心
+                        $found = [$gx, $gz];
+                    }
+                }
+                if ($found === null) {
+                    $this->sendChat($c, ['text' => '半径 10 区块内没找到这个群系，换个方向再试', 'color' => 'red'], 1);
+                    break;
+                }
+                [$tx2, $tz2] = $found;
+                $chunk = $this->world->chunk($tx2 >> 4, $tz2 >> 4);
+                $top = 64;
+                for ($y = 254; $y > 1; $y--) {
+                    if (($chunk->blockState($tx2 & 15, $y, $tz2 & 15) >> 4) !== 0) {
+                        $top = $y + 1;
+                        break;
+                    }
+                }
+                $c->x = $tx2 + 0.5;
+                $c->y = (float) $top;
+                $c->z = $tz2 + 0.5;
+                $c->send(self::C_POS_LOOK, (new Writer())
+                    ->double($c->x)->double($c->y)->double($c->z)
+                    ->float($c->yaw)->float($c->pitch)->byte(0));
+                $this->sendChat($c, ['text' => sprintf('%s 在区块 %d,%d（%d 区块外），已传送',
+                    self::biomeName($want), $tx2 >> 4, $tz2 >> 4,
+                    (int) max(abs(($tx2 >> 4) - $pcx), abs(($tz2 >> 4) - $pcz))),
+                    'color' => 'green'], 1);
+                break;
+
+            case 'brew':
+                if ($c->brewing === null) {
+                    $this->sendChat($c, ['text' => '先打开酿造台再敲 /brew', 'color' => 'gray'], 1);
+                    break;
+                }
+                $bk = $c->brewing['x'] . ',' . $c->brewing['y'] . ',' . $c->brewing['z'];
+                $rec = $this->brews[$bk] ?? null;
+                if ($rec === null) {
+                    $this->sendChat($c, ['text' => '没有酿造台记录', 'color' => 'red'], 1);
+                    break;
+                }
+                $txt = [];
+                foreach ($rec['slots'] as $i => $it) {
+                    $txt[] = $i . ':' . (is_array($it) ? $it['id'] . 'x' . $it['count'] : '-');
+                }
+                $this->sendChat($c, ['text' => '酿造台 ' . implode(' ', $txt)
+                    . '  进度=' . (int) $rec['brew'] . ' 燃料=' . (int) $rec['fuel'], 'color' => 'aqua'], 1);
+                break;
+
+            case 'ender':
+                // 现在数据在玩家自己的 ChestStore 里（cache/ender-<名字>.json）
+                $esl = $this->enderStore($c->username)->load(8, 4, 8);
+                $txt = [];
+                foreach ($esl as $i => $it) {
+                    if (is_array($it)) {
+                        $txt[] = "#{$i}:" . $it['id'] . 'x' . $it['count'] . '/' . ($it['damage'] ?? 0);
+                    }
+                }
+                $this->sendChat($c, ['text' => $txt === []
+                    ? '服务端末影箱是空的（cache/ender.json 里查不到你这个名字）'
+                    : '服务端末影箱：' . implode(' ', $txt), 'color' => 'aqua'], 1);
+                break;
+
+            case 'furnace':
+                // 自检：看服务端这边这台熔炉到底存了什么
+                $fx2 = (int) floor($c->x);
+                $fy2 = (int) floor($c->y) - 1;
+                $fz2 = (int) floor($c->z);
+                $fk2 = $fx2 . ',' . $fy2 . ',' . $fz2;
+                $rec = $this->furnaces[$fk2] ?? null;
+                if ($rec === null) {
+                    $this->sendChat($c, ['text' => "脚下方块 {$fk2} 没有熔炉记录", 'color' => 'red'], 1);
+                    break;
+                }
+                $fmt = function ($it) { return $it === null ? '空' : ($it['id'] . 'x' . $it['count']); };
+                $this->sendChat($c, ['text' => sprintf('熔炉 %s：输入 %s ｜ 燃料 %s ｜ 产出 %s ｜ 余火 %d ｜ 进度 %d/200',
+                    $fk2, $fmt($rec['in']), $fmt($rec['fuel']), $fmt($rec['out']),
+                    (int) $rec['burn'], (int) $rec['cook']), 'color' => 'aqua'], 1);
+                break;
+
+            case 'findvillage':
+            case 'village':
+                $pcx2 = (int) floor($c->x) >> 4;
+                $pcz2 = (int) floor($c->z) >> 4;
+                $vFound = null;
+                for ($vr = 0; $vr <= 64 && $vFound === null; $vr++) {
+                    for ($vdx = -$vr; $vdx <= $vr && $vFound === null; $vdx++) {
+                        for ($vdz = -$vr; $vdz <= $vr; $vdz++) {
+                            if (max(abs($vdx), abs($vdz)) !== $vr) {
+                                continue;
+                            }
+                            $vcx = $pcx2 + $vdx;
+                            $vcz = $pcz2 + $vdz;
+                            if (!VillageGenerator::isVillageChunk($this->world->seed(), $vcx, $vcz)) {
+                                continue;
+                            }
+                            if (in_array($this->world->chunkBiomes($vcx, $vcz)[8 * 16 + 8] ?? -1,
+                                VillageGenerator::BIOMES, true)) {
+                                $vFound = [$vcx, $vcz];
+                                break;
+                            }
+                        }
+                    }
+                }
+                if ($vFound === null) {
+                    $this->sendChat($c, ['text' => '64 区块内没有村庄', 'color' => 'red'], 1);
+                    break;
+                }
+                [$vcx, $vcz] = $vFound;
+                $vc = $this->world->chunk($vcx, $vcz);
+                $vTop = 64;
+                for ($vy = 254; $vy > 1; $vy--) {
+                    if (($vc->blockState(8, $vy, 8) >> 4) !== 0) {
+                        $vTop = $vy + 1;
+                        break;
+                    }
+                }
+                $c->x = $vcx * 16 + 8.5;
+                $c->y = (float) $vTop;
+                $c->z = $vcz * 16 + 8.5;
+                $c->send(self::C_POS_LOOK, (new Writer())
+                    ->double($c->x)->double($c->y)->double($c->z)
+                    ->float($c->yaw)->float($c->pitch)->byte(0));
+                $this->sendChat($c, ['text' => sprintf('村庄在区块 %d,%d（%d 区块外），已传送',
+                    $vcx, $vcz, (int) max(abs($vcx - $pcx2), abs($vcz - $pcz2))), 'color' => 'green'], 1);
+                break;
+
+            case 'spawn':
+                [$sx, $sy, $sz] = $this->world->spawnPoint();
+                $c->x = $sx + 0.5;
+                $c->y = (float) $sy;
+                $c->z = $sz + 0.5;
+                $c->send(self::C_POS_LOOK, (new Writer())
+                    ->double($c->x)->double($c->y)->double($c->z)
+                    ->float(0)->float(0)->byte(0));
+                $this->sendChat($c, ['text' => '已回到出生点', 'color' => 'green'], 1);
+                break;
+
+            case 'inv':
+                // 看服务端背包里到底有什么（含附魔），用来区分「数据丢了」和「没显示」
+                $rows = [];
+                foreach ($c->inventory as $slot => $it) {
+                    if (!is_array($it)) {
+                        continue;
+                    }
+                    $rows[] = $slot . ':' . $it['id']
+                        . (!empty($it['ench']) ? '(附魔' . json_encode($it['ench']) . ')' : '');
+                }
+                $this->sendChat($c, ['text' => $rows === [] ? '背包是空的' : implode(' ', $rows), 'color' => 'aqua'], 1);
+                break;
+
+            case 'debug':
+                $this->debugLog = !$this->debugLog;
+                $this->sendChat($c, ['text' => '调试日志：' . ($this->debugLog ? '已开启' : '已关闭'),
+                    'color' => 'aqua'], 1);
+                $this->log('  调试日志 ' . ($this->debugLog ? '开启' : '关闭'));
+                break;
+
+            case 'fluidfix':
+                // 手动重算周围的水（半径 16）。改完流体逻辑后不用重建世界，
+                // 敲一下就能让附近所有水/岩浆格子重新判断自己该不该留。
+                $fr = ($arg === '' || !is_numeric($arg)) ? 16 : (int) $arg;
+                $fr = max(4, min(48, $fr));
+                $cnt = 0;
+                $px = (int) floor($c->x);
+                $py = (int) floor($c->y);
+                $pz = (int) floor($c->z);
+                for ($dx = -$fr; $dx <= $fr; $dx++) {
+                    for ($dz = -$fr; $dz <= $fr; $dz++) {
+                        for ($dy = -8; $dy <= 8; $dy++) {
+                            $y2 = $py + $dy;
+                            if ($y2 < 1 || $y2 > 255) {
+                                continue;
+                            }
+                            $st = $this->world->chunk(($px + $dx) >> 4, ($pz + $dz) >> 4)
+                                ->blockState(($px + $dx) & 15, $y2, ($pz + $dz) & 15);
+                            $fid = $st >> 4;
+                            if ($fid === 8 || $fid === 9) {
+                                $this->startFluid($px + $dx, $y2, $pz + $dz, 0);
+                                $cnt++;
+                            } elseif ($fid === 10 || $fid === 11) {
+                                $this->startFluid($px + $dx, $y2, $pz + $dz, 1);
+                                $cnt++;
+                            }
+                        }
+                    }
+                }
+                $this->sendChat($c, ['text' => "已把 {$cnt} 格水/岩浆排进重算队列", 'color' => 'aqua'], 1);
+                $this->log("  /fluidfix 半径 {$fr} 排队 {$cnt} 格");
+                break;
+
+            case 'foodlog':
+                $this->foodDebug = !$this->foodDebug;
+                $this->sendChat($c, ['text' => '饱食度日志：' . ($this->foodDebug ? '已开启' : '已关闭'),
+                    'color' => 'aqua'], 1);
+                $this->log('  饱食度日志 ' . ($this->foodDebug ? '开启' : '关闭'));
+                break;
+
+            case 'xp':
+                // /xp <数量> 加经验（原版写法），不带参数则显示当前值
+                if (isset($parts[1]) && is_numeric($parts[1])) {
+                    $this->giveExp($c, (int) $parts[1]);
+                }
+                $this->sendChat($c, ['text' => sprintf(
+                    '经验：等级 %d，进度 %.2f，总计 %d 点（模式：%s）',
+                    $c->xpLevel, $c->xpProgress, $c->xpTotal,
+                    $c->gamemode === 1 ? '创造——经验条不显示，用 /gm 0 切生存' : '生存'
+                ), 'color' => 'aqua'], 1);
+                break;
+
+            case 'block':
+                if (count($parts) < 3) {
+                    $this->sendChat($c, ['text' => '用法：/block x y z', 'color' => 'red'], 1);
+                    break;
+                }
+                $bx = (int) $parts[0];
+                $by = (int) $parts[1];
+                $bz = (int) $parts[2];
+                $state = $this->world->chunk($bx >> 4, $bz >> 4)
+                    ->blockState($bx & 15, $by, $bz & 15);
+                $this->sendChat($c, [
+                    'text' => sprintf(
+                        '服务端认为 (%d,%d,%d) = 方块 %d meta %d %s',
+                        $bx,
+                        $by,
+                        $bz,
+                        $state >> 4,
+                        $state & 15,
+                        $state === 0 ? '（空气）' : ''
+                    ),
+                    'color' => 'yellow',
+                ], 1);
+                break;
+
+            case 'reload':
+                $saved = $this->world->save();
+                $n = $this->world->forgetChunks();
+                foreach ($this->players() as $p) {
+                    $p->sentChunks = [];
+                    $p->chunkQueue = [];
+                    $this->queueChunks($p);
+                }
+                $this->sendChat($c, [
+                    'text' => "已存盘 {$saved} 个，丢掉内存 {$n} 个区块，正在按磁盘重发",
+                    'color' => 'green',
+                ], 1);
+                $this->log("手动 reload：存盘 {$saved}，清缓存 {$n}");
+                break;
+
+            case 'spawn':
+                // /spawn <名字或 id> [数量]
+                // $parts 是 command() 上面已经切好的参数（命令名已被 shift 掉）
+                $key = strtolower($parts[0] ?? '');
+                $count = max(1, min(20, (int) ($parts[1] ?? 1)));
+                $type = 0;
+                if (ctype_digit($key)) {
+                    $type = (int) $key;
+                } else {
+                    foreach (self::MOB_TYPES as $id => [$name, $hostile]) {
+                        if ($name === $key) { $type = $id; break; }
+                    }
+                }
+                if (!isset(self::MOB_TYPES[$type])) {
+                    $names = [];
+                    foreach (self::MOB_TYPES as $id => [$name, $hostile]) { $names[] = $name; }
+                    $this->sendChat($c, ['text' => '用法：/spawn <' . implode('|', array_slice($names, 0, 6)) . '|...> [数量]', 'color' => 'yellow'], 1);
+                    break;
+                }
+                $baseY = (int) floor($c->y);
+                for ($i = 0; $i < $count; $i++) {
+                    $px = (int) floor($c->x) + random_int(-4, 4);
+                    $pz = (int) floor($c->z) + random_int(-4, 4);
+                    $py = $this->groundY($px, $pz, $baseY + 4);
+                    if ($py <= 0) { $py = $baseY; }
+                    $this->spawnMob($type, $px + 0.5, (float) $py, $pz + 0.5);
+                }
+                $this->log("  {$c->username} 生成了 {$count} 只 " . self::MOB_TYPES[$type][0]);
+                $this->sendChat($c, ['text' => "已生成 {$count} 只 " . self::MOB_TYPES[$type][0] . "（实体数 " . count($this->mobs) . '）', 'color' => 'green'], 1);
+                break;
+
+            case 'seed':
+                $this->sendChat($c, ['text' => '世界种子：' . $this->world->seed(), 'color' => 'aqua'], 1);
+                $this->log("  {$c->username} 查询种子：" . $this->world->seed());
+                break;
+
+            case 'redtest':
+                // 自检：在你前方摆「红石块 + 6 格导线」，看强度是不是 15,14,13,12,11,10
+                $bx = (int) floor($c->x);
+                $by = (int) floor($c->y) + 2;   // 抬高 2 格，确保是空气
+                $bz = (int) floor($c->z) + 3;
+                $this->changeBlock($bx, $by, $bz, 152, 0);
+                $srcId = $this->world->chunk($bx >> 4, $bz >> 4)->blockState($bx & 15, $by, $bz & 15) >> 4;
+                $this->log("  /redtest 电源格实际 id={$srcId}（应为 152）");
+                for ($i = 1; $i <= 6; $i++) {
+                    $this->changeBlock($bx + $i, $by, $bz, 55, 0);
+                }
+                $this->updateRedstoneAround($bx, $by, $bz);
+                $out = [];
+                for ($i = 1; $i <= 6; $i++) {
+                    $ch = $this->world->chunk(($bx + $i) >> 4, $bz >> 4);
+                    $out[] = $ch->blockState(($bx + $i) & 15, $by, $bz & 15) & 0x0F;
+                }
+                $got = implode(',', $out);
+                $want = '15,14,13,12,11,10';
+                $this->log("  /redtest 得到 {$got}，期望 {$want}");
+                $this->sendChat($c, [
+                    'text' => ($got === $want ? '红石链路正确：' : '红石链路异常：') . $got,
+                    'color' => $got === $want ? 'green' : 'red',
+                ], 1);
+                break;
+
+            case 'blocktest':
+                // 最小化 A/B 测试：往你面前 2 格发一个方块，看 F3 认不认
+                //   /blocktest stone   发石头(1<<4=16)
+                //   /blocktest chest   发箱子(864) + 0x35
+                $what = strtolower($parts[0] ?? 'stone');
+                // 暂停「书架伪装」：否则 1.5 秒一轮的补发会把刚发过去的
+                // 箱子状态又刷回书架，测试结果根本看不到。
+                $c->chestSections = [];
+                $c->chestSectionTimes = [];
+                $bx2 = (int) floor($c->x + sin(deg2rad(-$c->yaw)) * 2);
+                $bz2 = (int) floor($c->z + cos(deg2rad(-$c->yaw)) * 2);
+                $by2 = (int) floor($c->y);
+                $posHex = $this->packPositionBytes($bx2, $by2, $bz2);
+                if ($what === 'chest' || $what === 'chest35') {
+                    $st = 864;
+                    $c->send(self::C_BLOCK_CHANGE, (new Writer())->raw($posHex)->varInt($st));
+                    if ($what === 'chest35') {
+                        // 单独验证 0x35 会不会也炸：chest 只发 0x23，chest35 两个都发
+                        $this->sendTileEntity($c, $bx2, $by2, $bz2);
+                        $msg = '发箱子 state=864 + 0x35';
+                    } else {
+                        $msg = '只发方块状态 state=864（不发 0x35）';
+                    }
+                } else {
+                    $st = 1 << 4;
+                    $c->send(self::C_BLOCK_CHANGE, (new Writer())->raw($posHex)->varInt($st));
+                    $msg = "发石头 state=16";
+                }
+                $this->sendChat($c, ['text' => "{$msg} @ {$bx2},{$by2},{$bz2}——看 F3 的 Block 行", 'color' => 'aqua'], 1);
+                $this->log("  /blocktest {$what} @ {$bx2},{$by2},{$bz2} state={$st}（伪装已暂停）");
+                break;
+
+            case 'timeset':
+                // /timeset <0-23999>：0 早上、6000 中午、13000 日落、18000 午夜
+                if ($arg === '' || !is_numeric($arg)) {
+                    $this->sendChat($c, ['text' => '用法：/timeset <0-23999>（0 早、6000 中午、13000 日落、18000 午夜）', 'color' => 'yellow'], 1);
+                    break;
+                }
+                $this->world->setTimeOfDay((int) $arg);
+                $this->sendChat($c, ['text' => '时间已设为 ' . $this->world->timeOfDay() . '（' . ($this->isNight() ? '夜' : '昼') . '）', 'color' => 'aqua'], 1);
+                $this->log("  {$c->username} /timeset " . (int) $arg);
+                break;
+
+            case 'kill':
+                // /kill @e 杀光所有生物；/kill 只杀自己（受伤到 0）
+                if (($parts[0] ?? '') === '@e') {
+                    $n = count($this->mobs);
+                    foreach (array_keys($this->mobs) as $eid) {
+                        $this->removeMob($eid);
+                    }
+                    $this->sendChat($c, ['text' => "已清除 {$n} 只生物", 'color' => 'aqua'], 1);
+                    $this->log("  {$c->username} /kill @e 清除 {$n} 只");
+                } else {
+                    $this->damage($c, 20);
+                }
+                break;
+
+            case 'mobtest':
+                // 调试：不管昼夜、不管群系，把 16 种生物在你面前排一排
+                $baseY = (int) floor($c->y);
+                $fx = $c->x + sin(deg2rad(-$c->yaw)) * 5;
+                $fz = $c->z + cos(deg2rad(-$c->yaw)) * 5;
+                $i = 0;
+                $made = 0;
+                foreach (self::MOB_TYPES as $id => [$name, $hostile]) {
+                    $px = (int) floor($fx) + ($i % 4) * 2;
+                    $pz = (int) floor($fz) + intdiv($i, 4) * 2;
+                    $py = $this->groundY($px, $pz, $baseY + 4);
+                    if ($py <= 0) { $py = $baseY; }
+                    if ($this->spawnMob($id, $px + 0.5, (float) $py, $pz + 0.5) > 0) { $made++; }
+                    $i++;
+                }
+                $this->log("  {$c->username} /mobtest 生成了 {$made} 只（当前共 " . count($this->mobs) . '）');
+                $this->sendChat($c, ['text' => "调试：已生成 {$made} 只，站在你前方 5 格", 'color' => 'aqua'], 1);
+                break;
+
+            case 'hit':
+                [$hx, $hy, $hz, $hid, $hmeta] = $this->raycast($c, 5.0);
+                $this->sendChat($c, $hid === 0
+                    ? ['text' => '视线 5 格内没有方块', 'color' => 'gray']
+                    : [
+                        'text' => sprintf(
+                            '你正对着 (%d,%d,%d)：方块 id=%d meta=%d %s',
+                            $hx,
+                            $hy,
+                            $hz,
+                            $hid,
+                            $hmeta,
+                            $hmeta !== 0 ? '' : ''
+                        ),
+                        'color' => 'yellow',
+                    ], 1);
+                $this->log("  {$c->username} /hit -> {$hx},{$hy},{$hz} id={$hid} meta={$hmeta}");
+                break;
+
+            case 'save':
+                $n = $this->world->save();
+                $this->sendChat($c, [
+                    'text' => "已存盘 {$n} 个区块",
+                    'color' => 'green',
+                ], 1);
+                $this->log("手动存盘 {$n} 个区块");
+                break;
+
+            case 'who':
+                $names = array_map(static fn (Connection $p) => $p->username, $this->players());
+                $this->sendChat($c, ['text' => '在线：' . implode(', ', $names), 'color' => 'yellow'], 1);
+                break;
+
+            default:
+                $this->sendChat($c, ['text' => "未知命令 /{$cmd}，试试 /help", 'color' => 'red'], 1);
+        }
+    }
+
+    // ---------------- 杂项 ----------------
+
+    /** 食物 id => 恢复的饱食度（1.8 的常见食物） */
+    /**
+     * 每种食物的饱和度系数（1.8 原版 saturationModifier）。
+     * 实际加的饱和度 = food * modifier * 2，上限是当前饱食度。
+     */
+    private const FOOD_SAT = [
+        260 => 0.3,   // 苹果 4 -> 2.4
+        282 => 0.6,   // 蘑菇煲 6 -> 7.2
+        297 => 0.6,   // 面包 5 -> 6.0
+        319 => 0.3,   // 生猪排 3 -> 1.8
+        320 => 0.8,   // 熟猪排 8 -> 12.8
+        322 => 1.2,   // 金苹果 4 -> 9.6
+        349 => 0.1,   // 生鱼 2 -> 0.4
+        350 => 0.6,   // 熟鱼 5 -> 6.0
+        357 => 0.1,   // 曲奇 2 -> 0.4
+        360 => 0.3,   // 西瓜片 2 -> 1.2
+        363 => 0.3,   // 生牛肉 3 -> 1.8
+        364 => 0.8,   // 牛排 8 -> 12.8
+        365 => 0.3,   // 生鸡肉 2 -> 1.2
+        366 => 0.6,   // 熟鸡肉 6 -> 7.2
+        391 => 0.6,   // 胡萝卜 3 -> 3.6
+        392 => 0.3,   // 马铃薯 1 -> 0.6
+        393 => 0.6,   // 烤马铃薯 5 -> 6.0
+        394 => 0.3,   // 毒马铃薯 2 -> 1.2
+        400 => 0.3,   // 南瓜派 8 -> 4.8
+        423 => 0.3,   // 生羊肉 2 -> 1.2
+        424 => 0.8,   // 熟羊肉 6 -> 9.6
+    ];
+
+    private const FOOD = [
+        260 => 4,   // 苹果
+        282 => 6,   // 蘑菇煲
+        297 => 5,   // 面包
+        319 => 3,   // 生猪排
+        320 => 8,   // 熟猪排
+        322 => 4,   // 金苹果
+        349 => 2,   // 生鱼
+        350 => 5,   // 熟鱼
+        357 => 2,   // 曲奇
+        360 => 2,   // 西瓜片
+        363 => 3,   // 生牛肉
+        364 => 8,   // 牛排
+        365 => 2,   // 生鸡肉
+        366 => 6,   // 熟鸡肉
+        391 => 3,   // 胡萝卜
+        392 => 1,   // 马铃薯
+        393 => 5,   // 烤马铃薯
+        394 => 2,   // 毒马铃薯
+        400 => 8,   // 南瓜派
+        423 => 2,   // 生羊肉
+        424 => 6,   // 熟羊肉
+        393 => 2,   // 马铃薯
+        400 => 8,   // 南瓜派
+    ];
+
+    /** 右键食物：吃掉一个、回饱食度和血。 */
+    private function useItem(Connection $c, int $itemId): void
+    {
+        $food = self::FOOD[$itemId] ?? 0;
+        if ($food <= 0) {
+            return;
+        }
+        // 必须核对手上真有这玩意：客户端会一直发包，物品吃完之后
+        // 包里还是老 id，不核对就会「凭空吃东西」——饱食度看起来自动回满。
+        $held = $c->inventory[36 + $c->heldSlot] ?? null;
+        if (!is_array($held) || (int) $held['id'] !== $itemId) {
+            return;
+        }
+
+        // 饱食度满了就不能吃（原版行为）：不扣物品、不放动画
+        if ($c->food >= 20) {
+            return;
+        }
+
+        // 原版：按右键**开始**吃，1.6 秒后才真正吞下去（客户端动画也是这个长度）。
+        // 以前收到包就立刻扣物品，所以会出现「秒吃」和「动画放完了但没吃」。
+        $now = microtime(true);
+        if ($c->eatingItem === $itemId && $now < $c->eatAt) {
+            return;                        // 同一口还没嚼完，忽略重复包
+        }
+        $c->eatingItem = $itemId;
+        $c->eatAt = $now + 1.6;
+
+        return;
+    }
+
+    /** 嚼完了：扣物品、加饱食度和饱和度（由 tickFood 调用） */
+    private function finishEating(Connection $c): void
+    {
+        $itemId = $c->eatingItem;
+        $c->eatingItem = 0;
+        $food = self::FOOD[$itemId] ?? 0;
+        if ($food <= 0) {
+            return;
+        }
+        $slot = 36 + $c->heldSlot;
+        $it = $c->inventory[$slot] ?? null;
+        if ($it === null || (int) $it['id'] !== $itemId) {
+            return;                        // 中途换了手，不算吃完
+        }
+
+        if ($it['count'] > 1) {
+            $it['count']--;
+            $c->inventory[$slot] = $it;
+            $this->sendSlot($c, $slot, $it);
+        } else {
+            unset($c->inventory[$slot]);
+            $c->send(self::C_SET_SLOT, (new Writer())->byte(0)->short($slot)->short(-1));
+        }
+
+        $c->food = min(20, $c->food + $food);
+        // 饱和度约等于回血量的 1.2 倍（原版按食物表，这里简化）
+        // 原版 FoodStats.addStats：饱和度 = min(饱食度, 原饱和度 + food*modifier*2)
+        // modifier 每种食物不同，这里按 1.8 的数值表查
+        $mod = self::FOOD_SAT[$itemId] ?? 0.6;
+        $c->saturation = min((float) $c->food, $c->saturation + $food * $mod * 2.0);
+        // 【不要在这加血】吃东西只补饱食度和饱和度，回血由 tickFood 每 80 tick 处理。
+        $this->syncVitals($c);
+        $this->log("  {$c->username} 吃了方块{$itemId}，饱食度 {$c->food}，血 {$c->health}");
+    }
+
+    /** 加疲劳，攒够 4.0 掉 1 点饱食度并推血量包。 */
+    /**
+     * 饱食度系统：每 4 秒算一次
+     *   饱食度 >= 18 且没满血 → 回 1 点血（同时额外消耗）
+     *   饱食度 = 0        → 饿伤 1 点
+     * 原版是每 tick 判断、每 4 秒结算，这里按 4 秒结算更省。
+     */
+    /**
+     * 火焰/岩浆伤害：站在火或岩浆里，每 0.5 秒掉 1 点血。
+     * 原版是按接触盒算的，这里简化成「脚所在那一格」。
+     */
+    private function tickFireDamage(float $now): void
+    {
+        foreach ($this->players() as $p) {
+            if ($now - $p->lastFireTick < 0.5) {
+                continue;
+            }
+            $p->lastFireTick = $now;
+            $feet = $this->blockIdAt((int) floor($p->x), (int) floor($p->y), (int) floor($p->z));
+            if ($feet === 51) {                 // 火
+                $this->damage($p, 1);
+                if ($this->debugLog) {
+                    $this->log("  [火] {$p->username} 站在火里，掉血");
+                }
+            } elseif ($feet === 10 || $feet === 11) {   // 岩浆
+                $this->damage($p, 4);
+                if ($this->debugLog) {
+                    $this->log("  [火] {$p->username} 站在岩浆里，掉血 4");
+                }
+            }
+        }
+    }
+
+    private function tickFood(float $now): void
+    {
+        foreach ($this->players() as $f) {
+            if ($f->gamemode === 1) {
+                continue;
+            }
+            // 主循环一秒跑上千次，这里按 50ms 一档降到 20 TPS
+            if ($now - $f->lastFoodTick < 0.05) {
+                continue;
+            }
+            $f->lastFoodTick = $now;
+
+            // 嚼完了就吞：1.6 秒到点才扣物品、加饱食度
+            if ($f->eatingItem > 0 && $now >= $f->eatAt) {
+                $this->finishEating($f);
+            }
+
+            $f->prevFoodLevel = $f->food;
+
+            // ① 消耗结算：每 tick 检查一次（原版就是这样，不是攒到 4 秒）
+            if ($f->exhaustion > 4.0) {
+                $f->exhaustion -= 4.0;
+                if ($f->saturation > 0.0) {
+                    $f->saturation = max(0.0, $f->saturation - 1.0);
+                } else {
+                    $f->food = max(0, $f->food - 1);
+                }
+                $this->log(sprintf('  %s 消耗结算 -> 饱食 %d 饱和 %.1f',
+                    $f->username, $f->food, $f->saturation));
+                $this->syncVitals($f);
+            }
+
+            // ② 自然回血：饱食度 >= 18 且没满血，累计 80 tick 回 1 点
+            if ($this->naturalRegen && $f->food >= 18 && $f->health > 0 && $f->health < 20.0) {
+                $f->foodTimer++;
+                if ($f->foodTimer >= 80) {
+                    $before = $f->health;
+                    $f->health = min(20.0, $f->health + 1.0);
+                    $f->exhaustion = min(40.0, $f->exhaustion + 3.0);
+                    $f->foodTimer = 0;
+                    $this->log(sprintf('  [食物] %s 回血 %.1f -> %.1f', $f->username, $before, $f->health));
+                    $this->syncVitals($f);
+                }
+            } elseif ($f->food <= 0) {
+                // ③ 饿伤：同样 80 tick 一次
+                $f->foodTimer++;
+                if ($f->foodTimer >= 80) {
+                    $f->foodTimer = 0;
+                    if ($f->health > 1.0) {
+                        $this->damage($f, 1);
+                    }
+                }
+            } else {
+                // ④ 两个条件都不满足：计时器必须清零（原版行为）
+                $f->foodTimer = 0;
+            }
+        }
+    }
+
+    /**
+     * 唤醒玩家。1.8.9 的正确做法（原版 EntityPlayerMP.wakeUpPlayer）：
+     *   1. 广播 S0B Animation type=2（离开床的动画）
+     *   2. 给本人发 S08 位置与视角，把人放到床上方
+     * 之前我一直发 0x0A 填 -1，那是「进入床铺」的包，方向用错了 ——
+     * 客户端只会更混乱，人永远起不来。
+     */
+    /**
+     * 同步血量 / 饱食度 / 饱和度。
+     * 原版 EntityPlayerMP 只在「血量变了 || 饱食度变了 || 是否饥饿变了」时才发 0x06，
+     * 不是定时刷 —— 定时刷会让客户端的饥饿条反复重设，看起来一抖一抖的。
+     */
+    private function syncVitals(Connection $c, bool $force = false): void
+    {
+        $hungry = $c->saturation <= 0.0;
+        if (!$force
+            && $c->lastHealth === $c->health
+            && $c->lastFood === $c->food
+            && $c->wasHungry === $hungry) {
+            return;
+        }
+        if ($this->foodDebug) {
+            $this->log(sprintf('  [0x06] %s health=%.1f food=%d saturation=%.2f',
+                $c->username, $c->health, $c->food, $c->saturation));
+        }
+        $c->send(self::C_UPDATE_HEALTH, (new Writer())
+            ->float($c->health)->varInt($c->food)->float($c->saturation));
+        $c->lastHealth = $c->health;
+        $c->lastFood = $c->food;
+        $c->wasHungry = $hungry;
+    }
+
+    private function wakePlayer(Connection $c): void
+    {
+        foreach ($this->players() as $p) {
+            $p->send(self::C_ANIMATION, (new Writer())
+                ->varInt($c->entityId)->byte(2));     // 2 = leave bed
+        }
+        // 站到床上方，y 略微抬起（避免嵌进床里）
+        $c->y += 0.6;
+        $c->send(self::C_POS_LOOK, (new Writer())
+            ->double($c->x)->double($c->y)->double($c->z)
+            ->float($c->yaw)->float($c->pitch)->byte(0));
+        $this->log('  ' . $c->username . ' 起床（S0B 动画 2 + S08）');
+    }
+
+    private function addExhaustion(Connection $c, float $amount): void
+    {
+        if ($c->gamemode === 1) {
+            return;
+        }
+        // 原版 addExhaustion 只累计（封顶 40），真正的扣除在 FoodStats.onUpdate 里
+        $c->exhaustion = min(40.0, $c->exhaustion + $amount);
+        if ($this->foodDebug) {
+            $this->log(sprintf('  [食物] %s 消耗 +%.2f -> %.2f（饱食 %d 饱和 %.1f）',
+                $c->username, $amount, $c->exhaustion, $c->food, $c->saturation));
+        }
+    }
+
+    /**
+     * 从玩家的眼睛沿着视线走，最多 reach 格，返回第一个非空气方块。
+     * 用来回答「你正对着的到底是什么」——不靠截图猜。
+     *
+     * @return array{0:int,1:int,2:int,3:int,4:int} [x, y, z, id, meta]
+     */
+    private function raycast(Connection $c, float $reach): array
+    {
+        $yaw = deg2rad($c->yaw);
+        $pitch = deg2rad($c->pitch);
+        $ex = $c->x;
+        $ey = $c->y + 1.62;          // 眼睛高度
+        $ez = $c->z;
+        $dx = -sin($yaw) * cos($pitch);
+        $dy = -sin($pitch);
+        $dz = cos($yaw) * cos($pitch);
+
+        for ($s = 0.0; $s <= $reach; $s += 0.05) {
+            $bx = (int) floor($ex + $dx * $s);
+            $by = (int) floor($ey + $dy * $s);
+            $bz = (int) floor($ez + $dz * $s);
+            if ($by < 0 || $by > 255) {
+                continue;
+            }
+            $state = $this->world->chunk($bx >> 4, $bz >> 4)
+                ->blockState($bx & 15, $by, $bz & 15);
+            // 注意只看 id：空气的 meta 也可能非 0（state=1），不能当成方块
+            if (($state >> 4) !== 0) {
+                return [$bx, $by, $bz, $state >> 4, $state & 15];
+            }
+        }
+
+        return [0, 0, 0, 0, 0];
+    }
+
+    private function sendHealth(Connection $c): void
+    {
+        $this->syncVitals($c);
+    }
+
+    /** 发送窗口里的一个槽位（null = 空槽） */
+    private function sendWindowSlot(Connection $c, int $windowId, int $slot, ?array $item): void
+    {
+        $c->send(self::C_SET_SLOT, (new Writer())
+            ->byte($windowId)->short($slot)->raw($this->slotBytes($item)));
+    }
+
+    /**
+     * 同步服务端记录的光标物品。
+     * 1.8 里光标不是「当前窗口的 -1 号槽」：Set Slot 必须用
+     * windowId = -1、slot = -1。用窗口 ID 发，客户端会走容器分支去取
+     * get(-1)，直接 IndexOutOfBounds，背包/箱子/工作台全报错。
+     */
+    private function sendCursor(Connection $c): void
+    {
+        // 用「当前窗口 id + slot=-1」同步光标（原版就是这么发的）。
+        // 之前直接停用，导致服务端认为光标空了、客户端还拿着东西 ——
+        // 表现就是「合出来的东西拿在手上，点背包放不进去」。
+        // 注意 windowId 必须是当前打开的窗口，不能写 0，否则客户端找不到容器。
+        $wid = 0;
+        if ($c->anvil !== null) {
+            $wid = 8;
+        } elseif ($c->workbench) {
+            $wid = 2;
+        } elseif ($c->furnace !== null || $c->chest !== null) {
+            $wid = 1;
+        }
+        $c->send(self::C_SET_SLOT, (new Writer())
+            ->byte($wid)->short(-1)->raw($this->slotBytes($c->cursor)));
+    }
+
+    /** 按当前打开的窗口，把玩家背包槽位换算成容器槽位再发 Set Slot */
+    private function sendInventorySlot(Connection $c, int $invSlot, ?array $item): void
+    {
+        if ($c->chest !== null) {
+            $size = $c->chest['size'] ?? 27;
+            $slot = $invSlot <= 35 ? $size + ($invSlot - 9) : $size + 27 + ($invSlot - 36);
+            $this->sendWindowSlot($c, 1, $slot, $item);
+
+            return;
+        }
+        if ($c->workbench) {
+            $slot = $invSlot <= 35 ? 10 + ($invSlot - 9) : 37 + ($invSlot - 36);
+            $this->sendWindowSlot($c, 2, $slot, $item);
+
+            return;
+        }
+        $this->sendWindowSlot($c, 0, $invSlot, $item);
+    }
+
+    /** 关窗/掉线时把光标上的东西塞回背包，别吞掉 */
+    private function returnCursor(Connection $c): void
+    {
+        if ($c->cursor === null) {
+            return;
+        }
+        // 必须把 ench 一起传下去 —— 这里以前只传三个字段，
+        // 玩家拿着附魔剑按 E 关背包（走 0x0D → returnCursor），附魔就被重置了。
+        $extra = [];
+        if (!empty($c->cursor['ench'])) {
+            $extra['ench'] = $c->cursor['ench'];
+        }
+        $this->giveItem($c, $c->cursor['id'], $c->cursor['count'], $c->cursor['damage'], $extra);
+        $c->cursor = null;
+        $this->sendCursor($c);
+    }
+
+    /** 物品最大堆叠数：工具/武器/盔甲 1，雪球/鸡蛋/末影珍珠 16，其余 64 */
+    private static function maxStack(int $id): int
+    {
+        if (in_array($id, [
+            256, 257, 258, 259, 261,
+            267, 268, 269, 270, 271, 272, 273, 274, 275, 276, 277, 278, 279,
+            283, 284, 285, 286, 290, 291, 292, 293, 294,
+            298, 299, 300, 301, 302, 303, 304, 305, 306, 307, 308, 309,
+            310, 311, 312, 313, 314, 315, 316, 317,
+            346, 354, 355, 358, 359, 373,
+        ], true)) {
+            return 1;
+        }
+        if (in_array($id, [332, 344, 368], true)) {
+            return 16;
+        }
+
+        return 64;
+    }
+
+    /**
+     * 左键/右键点击的核心：根据当前槽位和服务端光标算新的 [槽位, 光标]。
+     * Click Window 包里带的是客户端预测后的光标，不能直接当槽位内容用。
+     *
+     * @return array{0:?array,1:?array} [新槽位物品, 新光标物品]
+     */
+    /**
+     * 复制一个物品栈并改数量，**保留其它字段**（ench 等）。
+     * 以前这里是手工 new 一个 ['id','count','damage']，
+     * 结果拆分堆叠时把附魔 NBT 丢了 —— 从附魔台拿出来附魔就没了。
+     */
+    private static function withCount(array $it, int $n): ?array
+    {
+        if ($n <= 0) {
+            return null;
+        }
+        $out = $it;
+        $out['count'] = $n;
+
+        return $out;
+    }
+
+    private static function clickedStacks(?array $cur, ?array $cursor, int $button): array
+    {
+        if ($cursor === null) {
+            if ($cur === null) {
+                return [null, null];
+            }
+            if ($button === 0) {
+                return [null, $cur];                 // 拿起整堆
+            }
+            $half = (int) ceil($cur['count'] / 2);
+            $rest = $cur['count'] - $half;
+            return [self::withCount($cur, $rest), self::withCount($cur, $half)];
+        }
+
+        if ($cur === null) {
+            if ($button === 0) {
+                return [$cursor, null];              // 放下整堆
+            }
+            $left = $cursor['count'] - 1;
+            $slot = self::withCount($cursor, 1);
+            $hand = self::withCount($cursor, $left);
+
+            return [$slot, $hand];
+        }
+
+        if ($cur['id'] === $cursor['id'] && $cur['damage'] === $cursor['damage']) {
+            if ($button === 0) {
+                $total = $cur['count'] + $cursor['count'];
+                $take = min(self::maxStack($cur['id']), $total);
+                $left = $total - $take;
+                $slot = ['id' => $cur['id'], 'count' => $take, 'damage' => $cur['damage']];
+                $hand = $left > 0 ? ['id' => $cursor['id'], 'count' => $left, 'damage' => $cursor['damage']] : null;
+
+                return [$slot, $hand];
+            }
+            if ($cur['count'] < self::maxStack($cur['id'])) {
+                $left = $cursor['count'] - 1;
+                $slot = ['id' => $cur['id'], 'count' => $cur['count'] + 1, 'damage' => $cur['damage']];
+                $hand = $left > 0 ? ['id' => $cursor['id'], 'count' => $left, 'damage' => $cursor['damage']] : null;
+
+                return [$slot, $hand];
+            }
+
+            return [$cur, $cursor];
+        }
+
+        return $button === 0 ? [$cursor, $cur] : [$cur, $cursor];
+    }
+
+    /** Shift 搬运：先合并同类，再找空位，把变化过的槽位都发回客户端 */
+    private function shiftStacks(Connection $c, int $from, array $stack, array $range): void
+    {
+        $remaining = $stack;
+        $changed = [];
+
+        for ($i = $range[0]; $i <= $range[1] && $remaining['count'] > 0; $i++) {
+            $it = $c->inventory[$i] ?? null;
+            if ($it === null || $it['id'] !== $remaining['id']
+                || $it['damage'] !== $remaining['damage']
+                || $it['count'] >= self::maxStack($remaining['id'])) {
+                continue;
+            }
+            $add = min(self::maxStack($remaining['id']) - $it['count'], $remaining['count']);
+            $it['count'] += $add;
+            $remaining['count'] -= $add;
+            $c->inventory[$i] = $it;
+            $changed[$i] = $it;
+        }
+        if ($remaining['count'] > 0) {
+            for ($i = $range[0]; $i <= $range[1]; $i++) {
+                if (isset($c->inventory[$i])) {
+                    continue;
+                }
+                $c->inventory[$i] = $remaining;
+                $changed[$i] = $remaining;
+                $remaining = null;
+                break;
+            }
+        }
+        if ($remaining === null) {
+            unset($c->inventory[$from]);
+            $changed[$from] = null;
+        } else {
+            $c->inventory[$from] = $remaining;
+            if ($remaining['count'] !== $stack['count']) {
+                $changed[$from] = $remaining;
+            }
+        }
+
+        foreach ($changed as $i => $it) {
+            $this->sendWindowSlot($c, 0, $i, $it);
+        }
+    }
+
+
+    /**
+     * Shift+点击背包物品时快速填入合成格（2x2 或 3x3）。
+     * 优先放整堆到第一个空格，其次合并到同类格；返回实际移入的数量。
+     */
+    private function quickFillGrid(Connection $c, int $windowId, array $stack): int
+    {
+        $limit = $windowId === 2 ? 9 : 4;
+        $grid = $windowId === 2 ? $c->craft9 : $c->craftGrid;
+        $moved = 0;
+
+        for ($i = 0; $i < $limit; $i++) {
+            if ($grid[$i] !== null) {
+                continue;
+            }
+            $grid[$i] = $stack;
+            $moved = $stack['count'];
+            break;
+        }
+        if ($moved === 0) {
+            for ($i = 0; $i < $limit; $i++) {
+                $it = $grid[$i];
+                if ($it === null || $it['id'] !== $stack['id'] || $it['damage'] !== $stack['damage']) {
+                    continue;
+                }
+                $add = min(self::maxStack($stack['id']) - $it['count'], $stack['count']);
+                if ($add <= 0) {
+                    continue;
+                }
+                $it['count'] += $add;
+                $grid[$i] = $it;
+                $moved = $add;
+                break;
+            }
+        }
+        if ($moved <= 0) {
+            return 0;
+        }
+
+        if ($windowId === 2) {
+            $c->craft9 = $grid;
+        } else {
+            $c->craftGrid = $grid;
+        }
+
+        return $moved;
+    }
+
+    /** 1.8 拖动（mode 5）：开始/经过/结束时才真正分发 */
+    private function handleDrag(Connection $c, int $windowId, int $slot, int $button): void
+    {
+        $phase = $button & 3;
+        $mouse = ($button >> 2) & 3;
+        $this->log("  拖动 window={$windowId} slot={$slot} button={$button} phase={$phase} cursor=" . json_encode($c->cursor));
+
+        if ($phase === 0) {
+            if ($slot !== -999 || $c->cursor === null) {
+                $this->resetDrag($c);
+
+                return;
+            }
+            $c->dragPhase = 1;
+            $c->dragButton = $mouse;
+            $c->dragSlots = [];
+
+            return;
+        }
+
+        if ($phase === 1) {
+            if ($c->cursor === null) {
+                $this->resetDrag($c);
+
+                return;
+            }
+            if ($c->dragPhase === 0) {
+                // 有些客户端会先发经过槽位，补一个开始
+                $c->dragPhase = 1;
+                $c->dragButton = $mouse;
+                $c->dragSlots = [];
+            }
+            if (!$this->dragSlotAllowed($c, $windowId, $slot)) {
+                return;
+            }
+            $cur = $this->dragGetSlot($c, $windowId, $slot);
+            if ($cur !== null && ($cur['id'] !== $c->cursor['id']
+                || $cur['damage'] !== $c->cursor['damage']
+                || $cur['count'] >= self::maxStack($cur['id']))) {
+                return;
+            }
+            $c->dragSlots[$slot] = $slot;
+
+            return;
+        }
+
+        if ($phase === 2) {
+            if ($c->dragPhase === 1) {
+                $this->applyDrag($c, $windowId);
+            }
+            $this->resetDrag($c);
+        }
+    }
+
+    private function resetDrag(Connection $c): void
+    {
+        $c->dragPhase = 0;
+        $c->dragButton = 0;
+        $c->dragSlots = [];
+    }
+
+    private function dragSlotAllowed(Connection $c, int $windowId, int $slot): bool
+    {
+        if ($windowId === 2) {
+            return ($slot >= 1 && $slot <= 9) || ($slot >= 10 && $slot <= 45);
+        }
+        if ($windowId === 1) {
+            $size = $c->chest['size'] ?? 27;
+
+            return $slot >= 0 && $slot <= $size + 35;
+        }
+
+        return ($slot >= 1 && $slot <= 4) || ($slot >= 9 && $slot <= 44);
+    }
+
+    private function dragGetSlot(Connection $c, int $windowId, int $slot): ?array
+    {
+        if ($windowId === 2) {
+            if ($slot >= 1 && $slot <= 9) {
+                return $c->craft9[$slot - 1];
+            }
+            $inv = $slot <= 36 ? 9 + ($slot - 10) : 36 + ($slot - 37);
+
+            return $c->inventory[$inv] ?? null;
+        }
+        if ($windowId === 1) {
+            return $this->windowSlots($c)[$slot];
+        }
+        if ($slot >= 1 && $slot <= 4) {
+            return $c->craftGrid[$slot - 1];
+        }
+
+        return $c->inventory[$slot] ?? null;
+    }
+
+    private function dragSetSlot(Connection $c, int $windowId, int $slot, ?array $item): void
+    {
+        if ($windowId === 2) {
+            if ($slot >= 1 && $slot <= 9) {
+                $c->craft9[$slot - 1] = $item;
+
+                return;
+            }
+            $inv = $slot <= 36 ? 9 + ($slot - 10) : 36 + ($slot - 37);
+            if ($item === null) {
+                unset($c->inventory[$inv]);
+            } else {
+                $c->inventory[$inv] = $item;
+            }
+
+            return;
+        }
+        if ($windowId === 1) {
+            $this->setWindowSlot($c, $slot, $item);
+
+            return;
+        }
+        if ($slot >= 1 && $slot <= 4) {
+            $c->craftGrid[$slot - 1] = $item;
+
+            return;
+        }
+        if ($item === null) {
+            unset($c->inventory[$slot]);
+        } else {
+            $c->inventory[$slot] = $item;
+        }
+    }
+
+    /** 结束拖动时把光标物品按左拖平均/右拖每格一个分发 */
+    private function applyDrag(Connection $c, int $windowId): void
+    {
+        $slots = array_values($c->dragSlots);
+        if ($slots === [] || $c->cursor === null) {
+            return;
+        }
+
+        $remaining = $c->cursor;
+        $limit = self::maxStack($remaining['id']);
+        $changed = [];
+        $gridChanged = false;
+
+        if ($c->dragButton === 0) {
+            $n = count($slots);
+            $per = intdiv($remaining['count'], $n);
+            foreach ($slots as $slot) {
+                if ($remaining['count'] <= 0) {
+                    break;
+                }
+                $cur = $this->dragGetSlot($c, $windowId, $slot);
+                $have = $cur !== null ? $cur['count'] : 0;
+                if ($cur !== null && ($cur['id'] !== $remaining['id']
+                    || $cur['damage'] !== $remaining['damage'])) {
+                    continue;
+                }
+                $add = min($per, $limit - $have, $remaining['count']);
+                if ($add <= 0) {
+                    continue;
+                }
+                $next = $cur !== null
+                    ? ['id' => $cur['id'], 'count' => $have + $add, 'damage' => $cur['damage']]
+                    : ['id' => $remaining['id'], 'count' => $add, 'damage' => $remaining['damage']];
+                $this->dragSetSlot($c, $windowId, $slot, $next);
+                $changed[$slot] = $next;
+                $remaining['count'] -= $add;
+                if (($windowId === 2 && $slot >= 1 && $slot <= 9)
+                    || ($windowId === 0 && $slot >= 1 && $slot <= 4)) {
+                    $gridChanged = true;
+                }
+            }
+        } else {
+            foreach ($slots as $slot) {
+                if ($remaining['count'] <= 0) {
+                    break;
+                }
+                $cur = $this->dragGetSlot($c, $windowId, $slot);
+                $have = $cur !== null ? $cur['count'] : 0;
+                if ($cur !== null && ($cur['id'] !== $remaining['id']
+                    || $cur['damage'] !== $remaining['damage'] || $have >= $limit)) {
+                    continue;
+                }
+                $next = $cur !== null
+                    ? ['id' => $cur['id'], 'count' => $have + 1, 'damage' => $cur['damage']]
+                    : ['id' => $remaining['id'], 'count' => 1, 'damage' => $remaining['damage']];
+                $this->dragSetSlot($c, $windowId, $slot, $next);
+                $changed[$slot] = $next;
+                $remaining['count']--;
+                if (($windowId === 2 && $slot >= 1 && $slot <= 9)
+                    || ($windowId === 0 && $slot >= 1 && $slot <= 4)) {
+                    $gridChanged = true;
+                }
+            }
+        }
+
+        $c->cursor = $remaining['count'] > 0 ? $remaining : null;
+        foreach ($changed as $slot => $item) {
+            $this->sendWindowSlot($c, $windowId, $slot, $item);
+        }
+        if ($gridChanged) {
+            if ($windowId === 2) {
+                $this->updateWorkbenchOutput($c);
+            } else {
+                $this->updateCraftOutput($c);
+            }
+        }
+        $this->sendCursor($c);
+    }
+
+    /**
+     * 玩家自己背包里的点击（windowId 0）。
+     * 注意：包里带的是客户端预测后的光标物品，服务端要用自己记录的
+     * $c->cursor 和当前槽位重新算，否则「拿起来」会被当成「放回去」，
+     * 客户端就会看到东西变双份。
+     */
+    /** 这个物品能不能放进这个盔甲槽（5 头 6 胸 7 腿 8 靴） */
+    private static function armorFits(int $slot, int $itemId): bool
+    {
+        $map = [
+            5 => [298, 302, 306, 310, 314],
+            6 => [299, 303, 307, 311, 315],
+            7 => [300, 304, 308, 312, 316],
+            8 => [301, 305, 309, 313, 317],
+        ];
+
+        return in_array($itemId, $map[$slot] ?? [], true);
+    }
+
+    private function clickInventory(Connection $c, int $slot, int $button, int $mode, ?array $cursor): void
+    {
+        // 2x2 合成格的 4 个槽位
+        if ($slot >= 1 && $slot <= 4) {
+            $i = $slot - 1;
+            if ($mode === 1) {
+                $it = $c->craftGrid[$i];
+                if ($it !== null) {
+                    $c->craftGrid[$i] = null;
+                    $this->sendWindowSlot($c, 0, $slot, null);
+                    $this->giveItem($c, $it['id'], $it['count'], $it['damage'],
+                        empty($it['ench']) ? [] : ['ench' => $it['ench']]);
+                    $this->updateCraftOutput($c);
+                    $this->sendCursor($c);
+                }
+
+                return;
+            }
+            if ($mode !== 0 || ($button !== 0 && $button !== 1)) {
+                $this->sendCursor($c);
+
+                return;
+            }
+            [$next, $newCursor] = self::clickedStacks($c->craftGrid[$i], $c->cursor, $button);
+            $c->craftGrid[$i] = $next;
+            $c->cursor = $newCursor;
+            $this->sendWindowSlot($c, 0, $slot, $next);
+            $this->updateCraftOutput($c);
+            $this->sendCursor($c);
+
+            return;
+        }
+        if ($slot === 0) {
+            $this->takeCraftOutput($c, $mode === 1);
+
+            return;
+        }
+
+        // 盔甲槽 5~8：以前直接 return，服务端不认，重发背包时又被「脱下来」。
+        // 5 头 / 6 胸 / 7 腿 / 8 靴
+        if ($slot >= 5 && $slot <= 8) {
+            if ($mode === 1) {                 // Shift：脱下来
+                $worn = $c->inventory[$slot] ?? null;
+                if ($worn !== null) {
+                    unset($c->inventory[$slot]);
+                    $this->giveItem($c, $worn['id'], $worn['count'], $worn['damage'],
+                        empty($worn['ench']) ? [] : ['ench' => $worn['ench']]);
+                }
+                $this->sendPlayerInventory($c);
+
+                return;
+            }
+            if ($mode !== 0 || ($button !== 0 && $button !== 1)) {
+                $this->sendCursor($c);
+
+                return;
+            }
+            $cur = $c->inventory[$slot] ?? null;
+            [$next, $newCursor] = self::clickedStacks($cur, $c->cursor, $button);
+            // 只允许对应部位的盔甲放进来
+            if ($next !== null && !self::armorFits($slot, (int) $next['id'])) {
+                $this->sendPlayerInventory($c);
+                $this->sendCursor($c);
+
+                return;
+            }
+            if ($next === null) {
+                unset($c->inventory[$slot]);
+            } else {
+                $c->inventory[$slot] = $next;
+            }
+            $c->cursor = $newCursor;
+            $this->sendPlayerInventory($c);
+            $this->sendCursor($c);
+
+            return;
+        }
+
+        if ($slot < 9 || $slot > 44) {
+            $this->sendCursor($c);
+
+            return;
+        }
+
+        $cur = $c->inventory[$slot] ?? null;
+
+        if ($mode === 1 && $cur !== null) {
+            // Shift+点击不再往 2x2 合成格塞东西（用户要求：必须手动放）。
+            // 改成原版的行为：快捷栏 ↔ 背包 互转。
+            $targets = $slot >= 36 ? range(9, 35) : range(36, 44);
+            foreach ($targets as $tSlot) {
+                $dst = $c->inventory[$tSlot] ?? null;
+                $max = self::maxStack((int) $cur['id']);
+                if ($dst === null) {
+                    $c->inventory[$tSlot] = $cur;
+                    unset($c->inventory[$slot]);
+                    $this->sendPlayerInventory($c);
+
+                    return;
+                }
+                if ((int) $dst['id'] === (int) $cur['id']
+                    && (int) ($dst['damage'] ?? 0) === (int) ($cur['damage'] ?? 0)
+                    && empty($dst['ench']) && empty($cur['ench'])
+                    && (int) $dst['count'] < $max) {
+                    $space = $max - (int) $dst['count'];
+                    $move = min($space, (int) $cur['count']);
+                    $c->inventory[$tSlot]['count'] = (int) $dst['count'] + $move;
+                    $left = (int) $cur['count'] - $move;
+                    if ($left <= 0) {
+                        unset($c->inventory[$slot]);
+                    } else {
+                        $c->inventory[$slot] = self::withCount($cur, $left);
+                    }
+                    $this->sendPlayerInventory($c);
+
+                    return;
+                }
+            }
+            $this->sendPlayerInventory($c);
+
+            return;
+        }
+
+        if ($mode === 1 && $cur !== null) {
+            // 旧逻辑（保留在下面但不会走到，防止误删）：
+            $moved = $this->quickFillGrid($c, 0, $cur);
+            if ($moved > 0) {
+                $left = $cur['count'] - $moved;
+                if ($left > 0) {
+                    $cur['count'] = $left;
+                    $c->inventory[$slot] = $cur;
+                } else {
+                    unset($c->inventory[$slot]);
+                }
+                $this->updateCraftOutput($c);
+                $this->sendCursor($c);
+
+                return;
+            }
+
+            $range = $slot >= 36 ? [9, 35] : [36, 44];
+            $this->shiftStacks($c, $slot, $cur, $range);
+            $this->sendCursor($c);
+
+            return;
+        }
+        if ($mode !== 0 || ($button !== 0 && $button !== 1)) {
+            $this->sendCursor($c);
+
+            return;
+        }
+
+        [$next, $newCursor] = self::clickedStacks($cur, $c->cursor, $button);
+        $c->cursor = $newCursor;
+        if ($next === null) {
+            unset($c->inventory[$slot]);
+        } else {
+            $c->inventory[$slot] = $next;
+        }
+        $this->sendWindowSlot($c, 0, $slot, $next);
+        $this->sendCursor($c);
+    }
+
+    /** 把 45 格背包推给客户端（windowId 0 = 玩家自己的背包） */
+    /**
+     * 加经验。1.8 的等级曲线：0-15 级每级 17 点，16-30 每级 37 点，之后每级 62 点。
+     * 直接按总经验换算等级，不用维护「当前级攒了多少」。
+     */
+    private function giveExp(Connection $c, int $amount): void
+    {
+        if ($amount <= 0) {
+            return;
+        }
+        $c->xpTotal += $amount;
+        $total = $c->xpTotal;
+        $level = 0;
+        $need = 0;
+        if ($total < 17 * 16) {
+            $level = intdiv($total, 17);
+        } elseif ($total < 17 * 16 + 37 * 15) {
+            $level = 16 + intdiv($total - 17 * 16, 37);
+        } else {
+            $level = 31 + intdiv($total - (17 * 16 + 37 * 15), 62);
+        }
+        $base = 0;
+        if ($level <= 16) {
+            $base = $level * 17;
+            $need = 17;
+        } elseif ($level <= 31) {
+            $base = 17 * 16 + ($level - 16) * 37;
+            $need = 37;
+        } else {
+            $base = 17 * 16 + 37 * 15 + ($level - 31) * 62;
+            $need = 62;
+        }
+        $this->loadXpStore();
+        $this->xpStore[strtolower($c->username)] = $total;
+        $this->saveXpStore();
+        $c->xpLevel = $level;
+        $c->xpProgress = $need > 0 ? min(1.0, ($total - $base) / $need) : 0.0;
+        $c->send(self::C_SET_EXPERIENCE, (new Writer())
+            ->float($c->xpProgress)->varInt($c->xpLevel)->varInt($c->xpTotal));
+    }
+
+    private function sendPlayerInventory(Connection $c): void
+    {
+        // 探针：确认「发给客户端的背包里确实带附魔」
+        foreach ($c->inventory as $probeSlot => $probeItem) {
+            if (is_array($probeItem) && !empty($probeItem['ench'])) {
+                $this->log(sprintf('  [探针] 下发附魔物品 槽%d=%d %s',
+                    $probeSlot, $probeItem['id'], json_encode($probeItem['ench'])));
+                break;
+            }
+        }
+
+        // 【关键】有容器打开时，背包必须按那个容器的窗口号 + 槽位映射逐格发。
+        // 之前一律发 window 0 的 45 格 —— 客户端在容器界面里收不到，
+        // 表现就是「在铁砧/工作台里拿到的东西，放进背包后消失」。
+        if ($c->workbench || $c->anvil !== null || $c->chest !== null || $c->furnace !== null) {
+            for ($i = 9; $i <= 44; $i++) {
+                $this->sendInventorySlot($c, $i, $c->inventory[$i] ?? null);
+            }
+
+            return;
+        }
+
+        $w = (new Writer())->byte(0)->short(45);
+        // 0 输出，1-4 2x2 合成格，5-8 盔甲，9-44 背包
+        $w->raw($this->slotBytes(self::matchCraft2x2($c->craftGrid)));
+        for ($i = 0; $i < 4; $i++) {
+            $w->raw($this->slotBytes($c->craftGrid[$i]));
+        }
+        for ($i = 5; $i <= 8; $i++) {
+            $w->raw($this->slotBytes($c->inventory[$i] ?? null));
+        }
+        for ($i = 9; $i < 45; $i++) {
+            $w->raw($this->slotBytes($c->inventory[$i] ?? null));
+        }
+        $c->send(self::C_WINDOW_ITEMS, $w);
+    }
+
+    private function sendWorkbenchItems(Connection $c): void
+    {
+        $w = (new Writer())->byte(2)->short(46);
+        // 0 输出，1-9 3x3 合成格，10-36 主背包，37-45 快捷栏
+        $w->raw($this->slotBytes(self::matchCraft3x3($c->craft9)));
+        for ($i = 0; $i < 9; $i++) {
+            $w->raw($this->slotBytes($c->craft9[$i]));
+        }
+        for ($i = 9; $i <= 35; $i++) {
+            $w->raw($this->slotBytes($c->inventory[$i] ?? null));
+        }
+        for ($i = 36; $i <= 44; $i++) {
+            $w->raw($this->slotBytes($c->inventory[$i] ?? null));
+        }
+        $c->send(self::C_WINDOW_ITEMS, $w);
+    }
+
+    private function sendChestItems(Connection $c): void
+    {
+        $size = $c->chest['size'] ?? 27;
+        $w = (new Writer())->byte(1)->short($size + 36);
+        foreach ($this->windowSlots($c) as $item) {
+            $w->raw($this->slotBytes($item));
+        }
+        $c->send(self::C_WINDOW_ITEMS, $w);
+    }
+
+    /** 用服务端状态整窗覆盖客户端，避免客户端本地预测和背包状态分叉 */
+    private function sendFullWindow(Connection $c): void
+    {
+        if ($c->chest !== null) {
+            $this->sendChestItems($c);
+
+            return;
+        }
+        if ($c->workbench) {
+            $this->sendWorkbenchItems($c);
+
+            return;
+        }
+        $this->sendPlayerInventory($c);
+    }
+
+    /**
+     * 掉血；掉到 0 就回出生点（不做死亡界面，先把机制跑通）。
+     * $kind: all|fire|fall|explosion|projectile —— 决定用哪种保护附魔。
+     */
+    private function damage(Connection $c, int $dmg, string $kind = 'all'): void
+    {
+        if ($dmg <= 0 || $c->gamemode === 1) {
+            return;
+        }
+        // 保护 / 火焰保护 / 摔落保护 / 爆炸保护 / 弹射物保护：每级约 4%，总上限 80%
+        $factor = $this->protectionFactor($c, $kind);
+        if ($factor > 0) {
+            $dmg = max(1, (int) round($dmg * (1 - $factor)));
+        }
+        $c->health = max(0.0, $c->health - $dmg);
+        $this->addExhaustion($c, 0.3);   // 原版：每次受伤 0.3
+        $this->syncVitals($c);
+        $this->log(sprintf('  %s 掉血 %d，剩 %.1f（来源 %s）',
+            $c->username, $dmg, $c->health,
+            debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2)[1]['function'] ?? '?'));
+
+        if ($c->health <= 0.0) {
+            // 重生点：睡过的床优先，否则世界出生点
+            if ($c->bedSpawn !== null) {
+                $c->x = (float) $c->bedSpawn[0];
+                $c->y = (float) $c->bedSpawn[1];
+                $c->z = (float) $c->bedSpawn[2];
+            } else {
+                [$sx, $sy, $sz] = $this->world->spawnPoint();
+                $c->x = (float) $sx + 0.5;
+                $c->y = (float) $sy;
+                $c->z = (float) $sz + 0.5;
+            }
+
+            $c->health = 20.0;
+            $c->food = 20;
+            $c->saturation = 5.0;
+            $c->fallFrom = -1.0;
+            $c->portalDim = 0;
+
+            // 客户端收到 0x07 会把世界整个丢掉重建：区块缓存要清，
+            // 背包也要重发，否则背包窗口里全是空的，得等他跨一次维度才恢复。
+            $c->sentChunks = [];
+            $c->chunkQueue = [];
+
+            $c->send(self::C_RESPAWN, (new Writer())
+                ->int(0)                       // 主世界
+                ->byte(1)                      // 难度 normal
+                ->byte($c->gamemode)
+                ->string('default'));
+            $c->send(self::C_POS_LOOK, (new Writer())
+                ->double($c->x)->double($c->y)->double($c->z)
+                ->float(0)->float(0)->byte(0));
+            $this->queueChunks($c);
+            $this->sendHealth($c);
+            $this->sendPlayerInventory($c);
+            $this->sendCursor($c);
+
+            $this->log(sprintf('  %s 死亡，重生到 %.1f,%.1f,%.1f%s',
+                $c->username, $c->x, $c->y, $c->z,
+                $c->bedSpawn !== null ? '（床上）' : '（世界出生点）'));
+        }
+    }
+
+    private function sendChat(Connection $c, array $component, int $position = 1): void
+    {
+        $json = json_encode($component, JSON_UNESCAPED_UNICODE);
+        if ($json === false) {
+            return;
+        }
+        $c->send(self::C_CHAT, (new Writer())->string($json)->byte($position));
+    }
+
+    private function broadcastChat(string $text, int $position = 0): void
+    {
+        $json = json_encode(['text' => $text], JSON_UNESCAPED_UNICODE);
+        if ($json === false) {
+            return;
+        }
+        $packet = (new Writer())->string($json)->byte($position);
+        foreach ($this->players() as $p) {
+            $p->send(self::C_CHAT, $packet);
+        }
+    }
+
+    private function statusJson(): string
+    {
+        $json = json_encode([
+            'version' => ['name' => self::VERSION, 'protocol' => self::PROTOCOL],
+            'players' => [
+                'max' => $this->maxPlayers,
+                'online' => count($this->players()),
+                'sample' => [],
+            ],
+            'description' => ['text' => $this->motd, 'color' => 'gold'],
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+        if ($json === false) {
+            throw new \RuntimeException('状态 JSON 编码失败');
+        }
+
+        return $json;
+    }
+
+    private function tick(): void
+    {
+        $now = microtime(true);
+
+        foreach ($this->conns as $c) {
+            if ($c->closed) {
+                continue;
+            }
+            if ($now - $c->lastRead > 30) {
+                if ($c->state === Connection::STATE_PLAY) {
+                    $c->send(self::C_DISCONNECT, (new Writer())
+                        ->string(json_encode(['text' => '读超时', 'color' => 'red'])));
+                    $c->flush();
+                }
+                $this->drop($c, '读超时');
+                continue;
+            }
+
+            if ($c->state === Connection::STATE_PLAY
+                && $c->keepAliveId !== 0
+                && $now - $c->keepAliveSentAt > 30) {
+                $this->drop($c, 'Keep Alive 无回应');
+            }
+        }
+
+        if ($now - $this->lastKeepAlive >= 10) {
+            $this->lastKeepAlive = $now;
+            foreach ($this->players() as $c) {
+                if ($c->keepAliveId !== 0) {
+                    continue; // 还没回，交给超时判断，别把计时器续上
+                }
+                $c->keepAliveId = random_int(1, 0x7FFFFFFF);
+                $c->keepAliveSentAt = $now;
+                $c->send(self::C_KEEP_ALIVE, (new Writer())->varInt($c->keepAliveId));
+            }
+        }
+
+        // 附魔看门狗：每拍先扫描一遍背包，把新附魔的物品纳入跟踪，
+        // 这样「这次游戏里刚附的装备」也能被保护（以前只认进服时的那几件）。
+        foreach ($this->players() as $wp) {
+            foreach ($wp->inventory as $scanSlot => $scanItem) {
+                if (is_array($scanItem) && !empty($scanItem['ench'])) {
+                    $wp->enchWatch[$scanSlot] = ['id' => $scanItem['id'], 'ench' => $scanItem['ench']];
+                }
+            }
+            foreach ($wp->enchWatch as $wSlot => $wSnap) {
+                $wNow = $wp->inventory[$wSlot] ?? null;
+                if (is_array($wNow) && !empty($wNow['ench'])) {
+                    continue;
+                }
+                // 丢了：只要这一格还是同一件物品，就把附魔补回去（自愈）
+                if (is_array($wNow) && (int) $wNow['id'] === (int) $wSnap['id']) {
+                    $wp->inventory[$wSlot]['ench'] = $wSnap['ench'];
+                    $this->log(sprintf('  [看门狗] 槽%d 物品 %d 附魔被抹掉，已自动补回 %s；最近包=[%s]',
+                        $wSlot, $wSnap['id'], json_encode($wSnap['ench']),
+                        implode(',', array_map(static fn ($v) => '0x' . dechex($v), $wp->pktLog))));
+                    $this->sendPlayerInventory($wp);
+                    continue;
+                }
+                $this->log(sprintf('  [看门狗] 槽%d 物品 %d 已经不是原来那件了（现在=%s），放弃跟踪',
+                    $wSlot, $wSnap['id'], $wNow === null ? 'null' : json_encode($wNow)));
+                unset($wp->enchWatch[$wSlot]);
+            }
+        }
+
+        $this->processDrops();
+        $this->tickXpOrbs($now);
+        $this->tickArrows($now);
+        $this->tickFood($now);
+        $this->tickFalling($now);
+        $this->tickFireDamage($now);
+        $this->tickPortals($now);
+        $this->tickPortalDimResync($now);
+        $this->tickDimSync($now);
+        $this->tickDragon($now);
+        $this->tickEndPortal($now);
+        $this->tickFluids($now);
+        $this->tickFurnaces($now);
+        $this->tickBrewing($now);
+        $this->tickCrops($now);
+        $this->tickMobs($now);
+        $this->tickSpawners($now);
+
+        // 实体保活：客户端在区块重载/某些情况下会把实体弄丢，
+        // 服务端只发一次就再也补不回来了（盔甲架/画「放完就消失」就是这个）。
+        // 每 2 秒把附近的实体重发一遍，成本很低。
+        if ($now - $this->lastEntityResend >= 2.0) {
+            $this->lastEntityResend = $now;
+            foreach ($this->players() as $ep) {
+                foreach ($this->spawnedEntities as $eid2 => $ent2) {
+                    if (abs($ent2['x'] - $ep->x) > 48 || abs($ent2['z'] - $ep->z) > 48) {
+                        continue;
+                    }
+                    // 船：每次重发前重新吸附水面。被水流推到新的格子后，
+                    // 原来存的 y 可能已经在水下甚至方块里，客户端就不画了。
+                    if ((int) $ent2['type'] === 1) {
+                        $snapY = $this->waterSurfaceY(
+                            (int) floor($ent2['x']), (int) floor($ent2['z']), (int) floor($ent2['y'])
+                        );
+                        if ($snapY > 0) {
+                            $this->spawnedEntities[$eid2]['y'] = (float) $snapY;
+                            $ent2['y'] = (float) $snapY;
+                        }
+                    }
+                    $w2 = (new Writer())
+                        ->varInt((int) $eid2)
+                        ->byte((int) $ent2['type'])
+                        ->int((int) ($ent2['x'] * 32))
+                        ->int((int) ($ent2['y'] * 32))
+                        ->int((int) ($ent2['z'] * 32))
+                        ->byte(0)->byte(0);
+                    $data2 = (int) ($ent2['data'] ?? 0);
+                    $w2->int($data2);
+                    if ($data2 > 0) {
+                        $w2->short(0)->short(0)->short(0);
+                    }
+                    $ep->send(self::C_SPAWN_OBJECT, $w2);
+                }
+                foreach ($this->armorStands as $aeid => [$ax5, $ay5, $az5]) {
+                    if (abs($ax5 - $ep->x) > 48 || abs($az5 - $ep->z) > 48) {
+                        continue;
+                    }
+                    $ep->send(self::C_SPAWN_MOB, (new Writer())
+                        ->varInt((int) $aeid)->byte(30)
+                        ->int($ax5 * 32)->int($ay5 * 32)->int($az5 * 32)
+                        ->byte(0)->byte(0)->byte(0)
+                        ->short(0)->short(0)->short(0)
+                        ->unsignedByte(0x00)->unsignedByte(0x00)
+                        ->unsignedByte(0x7F));
+                }
+                foreach ($this->paintings as [$px5, $py5, $pz5, $pt5, $pd5, $pyaw5]) {
+                    if (abs($px5 - $ep->x) > 48 || abs($pz5 - $ep->z) > 48) {
+                        continue;
+                    }
+                    $ep->send(self::C_SPAWN_PAINTING, (new Writer())
+                        ->string($pt5)->int($px5)->int($py5)->int($pz5)
+                        ->float($pyaw5)->byte($pd5));
+                }
+            }
+        }
+
+        // 乘坐保活：客户端有时会把「骑乘」状态丢掉（船追得慢、位置误差大），
+        // 每 1.5 秒重发一次挂载包，让它重新挂上。
+        foreach ($this->players() as $rp) {
+            if ($rp->riding <= 0 || !isset($this->spawnedEntities[$rp->riding])) {
+                continue;
+            }
+            // 重发挂载的条件：船离玩家足够近（不会把玩家拽回去），
+            // 这样既能防止客户端自己下船，又不会产生拖拽感。
+            $bs = $this->spawnedEntities[$rp->riding];
+            $dd = sqrt(($bs['x'] - $rp->x) ** 2 + ($bs['z'] - $rp->z) ** 2);
+            if ($dd > 1.0) {
+                continue;
+            }
+            // 只在玩家站定时重发：这时船就在脚下，挂载不会把玩家拽动。
+            // 走动中不重发（那才是「拉回」的来源），停下来再挂。
+            if ($now - $rp->lastMoveAt < 1.0) {
+                continue;
+            }
+            if ($now - $rp->rideSyncAt < 1.0) {
+                continue;
+            }
+            $rp->rideSyncAt = $now;
+            foreach ($this->players() as $rv) {
+                $rv->send(self::C_ATTACH_ENTITY, (new Writer())
+                    ->int($rp->entityId)->int($rp->riding)->byte(0));
+            }
+        }
+
+        // 末影箱重试：再发一次 0x35 + 同状态 0x23
+        foreach ($this->players() as $ec) {
+            if ($ec->enderRetries === []) {
+                continue;
+            }
+            foreach ($ec->enderRetries as $ei => [$et, $ex, $ey, $ez]) {
+                if ($now < $et) {
+                    continue;
+                }
+                unset($ec->enderRetries[$ei]);
+                $this->nudgeEnderChestRender($ec, $ex, $ey, $ez);
+            }
+            $ec->enderRetries = array_values($ec->enderRetries);
+        }
+
+        // 把临时抹掉的床恢复回去
+        if ($this->pendingBedRestore !== []) {
+            foreach ($this->pendingBedRestore as $i5 => $rb) {
+                if ($now < $rb[0]) {
+                    continue;
+                }
+                unset($this->pendingBedRestore[$i5]);
+                foreach ($this->players() as $rp) {
+                    $rp->send(self::C_BLOCK_CHANGE, (new Writer())
+                        ->raw($this->packPositionBytes($rb[1], $rb[2], $rb[3]))
+                        ->varInt($rb[4]));
+                }
+            }
+        }
+
+        // 睡觉：到点了就叫起来并跳到天亮
+        if ($this->sleeping !== []) {
+            foreach ($this->sleeping as $eid => $until) {
+                if ($now < $until) {
+                    continue;
+                }
+                unset($this->sleeping[$eid]);
+                // 跳夜：推进到下一个完整的 24000 tick 边界（原版行为）
+                $t = $this->world->timeOfDay() + 24000;
+                $this->world->setTimeOfDay($t - ($t % 24000));
+                foreach ($this->players() as $sv) {
+                    $sv->send(self::C_TIME_UPDATE, (new Writer())
+                        ->long($this->world->worldAge())
+                        ->long($this->world->timeOfDay()));
+                }
+                foreach ($this->conns as $sp2) {
+                    if ($sp2->closed || $sp2->entityId !== $eid) {
+                        continue;
+                    }
+                    $this->wakePlayer($sp2);
+                    $this->sendChat($sp2, ['text' => '一觉睡到天亮。', 'color' => 'green'], 1);
+                }
+            }
+        }
+
+        // 每秒同步一次时间，客户端天空才会真的昼→夜
+        if ($now - $this->lastTimeSync >= 1.0) {
+            $this->lastTimeSync = $now;
+            // 每秒补一次 0x06。原版只在变化时发，但我们的客户端会「自己涨回满」，
+            // 不发就看不出真实饱食度（也就不知道自己能不能吃）。用户要求保留。
+            foreach ($this->players() as $fp) {
+                $this->syncVitals($fp, true);
+            }
+            foreach ($this->players() as $p) {
+                $p->send(self::C_TIME_UPDATE, (new Writer())
+                    ->long($this->world->worldAge())
+                    ->long($this->world->timeOfDay()));
+            }
+        }
+
+        // 箱子段补发：进服 2 秒 / 5 秒后，把带箱子的区块段整段再发一次。
+        // 只发段数据（方块+光），不发空气、不改方块；客户端收到会重建渲染区块，
+        // 这时 RenderChunk 会按方块自己建出 TileEntityChest，箱子就能画出来。
+        foreach ($this->players() as $p) {
+            if ($p->chestSections === [] || $p->chestSectionTimes === [] || $now < $p->chestSectionTimes[0]) {
+                continue;
+            }
+            array_shift($p->chestSectionTimes);
+            $p->chestFixRound++;
+            $sent = 0;
+            foreach ($p->chestSections as [$scx, $scz, $sy]) {
+                // 不发段数据了（段重发会把客户端的 TE 打掉、光也会被旧值覆盖）。
+                // 只对这个段里的每个箱子喂一次 0x35：
+                // 客户端 handleUpdateTileEntity 第一句 world.s(pos) 是
+                // getTileEntity(IMMEDIATE)，会当场 createNewTileEntity。
+                $chunk = $this->world->chunk($scx, $scz);
+                foreach (array_merge($chunk->blockPositions(54), $chunk->blockPositions(146)) as [$bx, $by, $bz]) {
+                    if (($by >> 4) !== $sy) {
+                        continue;
+                    }
+                    // 正确做法（依据客户端源码）：
+                    // 1) 先发 0x35，让客户端 chunk.getTileEntity(pos, IMMEDIATE) 造出
+                    //    TileEntityChest 并放进 loadedTileEntityList；
+                    // 2) 再发一个「同状态」的 0x23。WorldClient.setBlockState 会无条件
+                    //    markBlockRangeForRenderUpdate，而 Chunk.setBlockState 发现 state
+                    //    没变会返回 null —— 方块不动、TE 不删，只触发一次 RenderChunk.rebuild，
+                    //    重建时 TE 才被收进 CompiledChunk，箱子这才画得出来。
+                    // 之前发书架(47<<4) 是错的：换方块会把箱子的 TE 删掉。
+                    // 走了很久的弯路，结论是 1.8 客户端在「区块已编译完之后」
+                    // 收 0x35 也不会把 TE 塞进 CompiledChunk，同状态 0x23 触发重建
+                    // 也没用（我们验证过多轮）。
+                    //
+                    // 所以退回「客户端画成书架」：服务端方块数据仍然是 54，
+                    // 右键查的是我们自己的世界数据，开箱/存取完全不受影响。
+                    // 书架是储物类方块里唯一不需要 TE 的，一定画得出来。
+                    $this->sendTileEntity($p, $bx, $by, $bz);
+                    // 发真实方块状态（54 = 箱子），不再用书架伪装。
+                    // 之前退回书架是因为「箱子画不出来」，但那会儿地形本身就是坏的，
+                    // 现在地形修好了，先按标准做法来：真方块 + TE + 触发重建。
+                    $st = $this->world->chunk($bx >> 4, $bz >> 4)->blockState($bx & 15, $by, $bz & 15);
+                    if (($st >> 4) !== 54) {
+                        $st = 54 << 4;   // 兜底：读不到就按朝北的箱子发
+                    }
+                    $p->send(self::C_BLOCK_CHANGE, (new Writer())
+                        ->raw($this->packPositionBytes($bx, $by, $bz))
+                        ->varInt($st));
+
+                    $sent++;
+                }
+            }
+            if ($p->chestSectionTimes === []) {
+                $p->chestSections = [];
+            }
+            if ($sent > 0) {
+                $this->log("  补发箱子段 {$sent} 个 -> {$p->username}（剩 " . count($p->chestSectionTimes) . ' 轮）');
+            }
+        }
+
+        foreach ($this->players() as $p) {
+            if ($p->chunkQueue !== []) {
+                $this->flushChunkQueue($p);
+            }
+            // 1 秒后广播「我来了」：先 Tab 再 Spawn，两边都等过了处理窗口
+            if ($p->announceAt > 0 && $now >= $p->announceAt) {
+                $p->announceAt = 0.0;
+                foreach ($this->players() as $other) {
+                    if ($other === $p) {
+                        continue;
+                    }
+                    $this->sendTabAdd($other, $p);
+                    $this->sendSpawnPlayer($other, $p);
+                }
+            }
+            // 1 秒后重建：先拆实体再 Spawn。
+            //
+            // 两边要求不一样：Java 端建实体时会拿 uuid 去 Tab 列表查 GameProfile，
+            // 查不到就是 null（没名字没皮肤），而且之后同 eid 的 Spawn 它直接忽略；
+            // eaglercraft 反过来，重复 Spawn 会丢实体。
+            // 唯一能让两边都拿到名字的办法：Tab 先进 map，然后**销毁重建一次**。
+            if ($p->resendPeersAt > 0 && $now >= $p->resendPeersAt) {
+                $p->resendPeersAt = 0.0;
+                foreach ($this->players() as $other) {
+                    if ($other === $p) {
+                        continue;
+                    }
+                    $p->send(self::C_DESTROY_ENTITIES, (new Writer())
+                        ->varInt(1)->varInt($other->entityId));
+                    $this->sendTabAdd($p, $other);
+                    $this->sendSpawnPlayer($p, $other);
+                }
+            }
+            if ($p->resendInvAt > 0 && $now >= $p->resendInvAt) {
+                $p->resendInvAt = 0.0;
+                $this->sendPlayerInventory($p);
+                $this->sendCursor($p);
+            }
+        }
+
+        // 改了方块两秒内落盘：进程被硬关也最多丢两秒
+        if ($now - $this->lastSave >= 2) {
+            $this->lastSave = $now;
+            $n = $this->world->save();
+            if ($n > 0) {
+                $this->log("存盘 {$n} 个区块");
+            }
+        }
+    }
+
+    private function drop(Connection $c, string $why): void
+    {
+        if ($c->closed) {
+            return;
+        }
+        $wasPlaying = $c->state === Connection::STATE_PLAY;
+        $key = (int) $c->socket;
+        $c->closed = true;
+        @fclose($c->socket);
+        unset($this->conns[$key]);
+        $this->log("- 断开 {$c->remote}" . ($c->username !== '' ? " ({$c->username})" : '') . " ({$why})");
+
+        if ($wasPlaying) {
+            // 客户端崩了/直接断线时不会发 Close Window，箱子内容得在这里补存，
+            // 不然刚放进去的东西就丢了。
+            if ($c->chest !== null) {
+                $this->saveChestWindow($c);
+                $c->chest = null;
+            }
+            $this->closeWorkbench($c);
+            // 铁砧里放着东西就断线（比如改名那一下崩了）→ 东西必须还回去，
+            // 之前没这一步，改名中途被踢，槽里的物品就凭空消失了。
+            if ($c->anvil !== null) {
+                $this->closeAnvil($c);
+            }
+            $this->resetDrag($c);
+            if ($c->cursor !== null) {
+                // 光标上的东西还没放下就断线：塞回背包，别吞掉
+                $cursor = $c->cursor;
+                $c->cursor = null;
+                $this->giveItem($c, $cursor['id'], $cursor['count'], $cursor['damage']);
+            }
+            $this->returnCraftGrid($c);
+            $this->log("  存背包 " . count($c->inventory) . ' 格');
+            $this->world->rememberVitals($c->username, $c->food, $c->health);
+            $this->world->rememberGamemode($c->username, $c->gamemode);
+            $this->world->rememberInventory($c->username, $c->inventory);
+            $this->world->rememberPosition(
+                $c->username,
+                $c->x,
+                $c->y,
+                $c->z,
+                $c->yaw,
+                $c->pitch
+            );
+            foreach ($this->players() as $other) {
+                $other->send(self::C_DESTROY_ENTITIES, (new Writer())
+                    ->varInt(1)->varInt($c->entityId));
+                $this->sendTabRemove($other, $c);
+            }
+            $this->broadcastChat('§e' . $c->username . ' 离开了游戏', 1);
+            $this->world->save();
+        }
+    }
+
+    /** 群系 id → 中文名（只列常用的） */
+    private const BIOME_NAMES = [
+        0 => '海洋', 1 => '平原', 2 => '沙漠', 3 => '山地', 4 => '森林', 5 => '针叶林',
+        6 => '沼泽', 7 => '河流', 10 => '冰海', 12 => '冰原', 13 => '雪山', 14 => '蘑菇岛',
+        16 => '沙滩', 17 => '沙漠丘陵', 18 => '森林丘陵', 19 => '针叶林丘陵', 20 => '山地边缘',
+        21 => '丛林', 22 => '丛林丘陵', 23 => '丛林边缘', 24 => '深海', 25 => '石滩',
+        26 => '冷沙滩', 27 => '白桦林', 28 => '白桦林丘陵', 29 => '黑森林', 30 => '冷针叶林',
+        31 => '冷针叶林丘陵', 32 => '巨型针叶林', 33 => '巨型针叶林丘陵', 34 => '山地+',
+        35 => '热带草原', 36 => '热带草原高原', 37 => '台地', 38 => '台地高原', 39 => '台地高原F',
+        129 => '向日葵平原', 130 => '花林', 140 => '冰刺平原',
+    ];
+
+    public static function biomeName(int $id): string
+    {
+        return self::BIOME_NAMES[$id] ?? ('未知群系 ' . $id);
+    }
+
+    /** 名字或数字 → 群系 id */
+    public static function biomeIdByName(string $q): ?int
+    {
+        $q = trim($q);
+        if ($q !== '' && ctype_digit($q)) {
+            return (int) $q;
+        }
+        $alias = [
+            '雪原' => 12, '冰原' => 12, '雪山' => 13, '桦木林' => 27, '桦树林' => 27,
+            '黑森林' => 29, '丛林' => 21, '雨林' => 21, '沙漠' => 2, '平原' => 1,
+            '森林' => 4, '针叶林' => 5, '沼泽' => 6, '热带草原' => 35, '草原' => 35,
+            '台地' => 37, '恶地' => 37, '山地' => 3, '海洋' => 0, '蘑菇岛' => 14, '沙滩' => 16,
+        ];
+        if (isset($alias[$q])) {
+            return $alias[$q];
+        }
+        foreach (self::BIOME_NAMES as $id => $name) {
+            if ($name === $q) {
+                return $id;
+            }
+        }
+
+        return null;
+    }
+
+    public static function offlineUuid(string $name): string
+    {
+        $h = md5('OfflinePlayer:' . $name, true);
+        $h[6] = chr((ord($h[6]) & 0x0F) | 0x30);
+        $h[8] = chr((ord($h[8]) & 0x3F) | 0x80);
+        $hex = bin2hex($h);
+
+        return substr($hex, 0, 8) . '-' . substr($hex, 8, 4) . '-' . substr($hex, 12, 4)
+            . '-' . substr($hex, 16, 4) . '-' . substr($hex, 20, 12);
+    }
+
+    private static function gameModeName(int $gm): string
+    {
+        return match ($gm) {
+            0 => '生存',
+            1 => '创造',
+            2 => '冒险',
+            3 => '旁观',
+            default => (string) $gm,
+        };
+    }
+
+    private static function angle(float $deg): int
+    {
+        return ((int) round($deg * 256 / 360)) & 0xFF;
+    }
+
+    private function packPosition(int $x, int $y, int $z): int
+    {
+        return (($x & 0x3FFFFFF) << 38) | (($y & 0xFFF) << 26) | ($z & 0x3FFFFFF);
+    }
+
+    /**
+     * 同样一个位置，直接给出 8 字节大端。
+     *
+     * 上面那个 packPosition 在**负坐标**时是坏的：
+     *   ($x & 0x3FFFFFF) << 38  ->  x = -94 时约 1.8e19，超过 PHP_INT_MAX，
+     *   PHP 静默转成 float，pack('J') 写出来的 8 字节就是垃圾。
+     * 客户端收到错误坐标，Block Change / TileEntity 全落到别处，
+     * 表现出来就是「发了包但世界毫无反应」。
+     *
+     * 这里按 64 位的高/低 32 位分开拼，不产生溢出。
+     */
+    private function packPositionBytes(int $x, int $y, int $z): string
+    {
+        $hi = (($x & 0x3FFFFFF) << 6) | (($y & 0xFFF) >> 6);
+        $lo = ((($y & 0xFFF) & 0x3F) << 26) | ($z & 0x3FFFFFF);
+
+        return pack('N2', $hi & 0xFFFFFFFF, $lo & 0xFFFFFFFF);
+    }
+
+    /** @return array{0:int,1:int,2:int} */
+    private function unpackPosition(int $v): array
+    {
+        $x = $v >> 38;
+        if ($x >= 1 << 25) {
+            $x -= 1 << 26;
+        }
+        $y = ($v >> 26) & 0xFFF;
+        $z = $v & 0x3FFFFFF;
+        if ($z >= 1 << 25) {
+            $z -= 1 << 26;
+        }
+
+        return [$x, $y, $z];
+    }
+
+    /**
+     * 找玩家点的那块「空气」旁边最近的箱子。
+     * 先按点击的面找（客户端点幽灵半箱时，真箱子就在面朝的方向），
+     * 找不到再按四个水平方向兜底。
+     *
+     * @return array{0:int,1:int,2:int}|null
+     */
+    private function chestNextTo(int $x, int $y, int $z, int $face): ?array
+    {
+        [$tx, $ty, $tz] = self::offsetByFace($x, $y, $z, $face);
+        if ($this->chestIdAt($tx, $ty, $tz) === 54) {
+            return [$tx, $ty, $tz];
+        }
+        foreach ([[1, 0], [-1, 0], [0, 1], [0, -1]] as [$dx, $dz]) {
+            if ($this->chestIdAt($x + $dx, $y, $z + $dz) === 54) {
+                return [$x + $dx, $y, $z + $dz];
+            }
+        }
+
+        return null;
+    }
+
+    /** @return array{0:int,1:int,2:int} */
+    private static function offsetByFace(int $x, int $y, int $z, int $face): array
+    {
+        return match ($face) {
+            0 => [$x, $y - 1, $z],
+            1 => [$x, $y + 1, $z],
+            2 => [$x, $y, $z - 1],
+            3 => [$x, $y, $z + 1],
+            4 => [$x - 1, $y, $z],
+            5 => [$x + 1, $y, $z],
+            default => [$x, $y, $z],
+        };
+    }
+
+    public function log(string $msg): void
+    {
+        $t = sprintf('%.3f', microtime(true) - $this->startedAt);
+        $line = '[' . date('H:i:s') . "][{$t}s] {$msg}\n";
+        fwrite(STDOUT, $line);
+
+        // 同时落一份文件：终端滚上去就什么都看不见了
+        $dir = __DIR__ . '/../logs';
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0777, true);
+        }
+        @file_put_contents($dir . '/server.log', $line, FILE_APPEND);
+    }
+}
