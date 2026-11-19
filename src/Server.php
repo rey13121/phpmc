@@ -1741,7 +1741,17 @@ final class Server
                             $sv->send(self::C_USE_BED, (new Writer())
                                 ->varInt($c->entityId)->raw($bedPos));
                         }
-                        $this->sendChat($c, ['text' => '你躺下了……', 'color' => 'gray'], 1);
+                        $asleep = count($this->sleeping);
+                        $needN = 0;
+                        foreach ($this->players() as $sp) {
+                            if ($sp->gamemode !== 1 && $sp->gamemode !== 3) {
+                                $needN++;
+                            }
+                        }
+                        $tip = $needN > 1
+                            ? "你躺下了……（{$asleep}/{$needN} 人在床上，全员睡着后天亮）"
+                            : '你躺下了……';
+                        $this->sendChat($c, ['text' => $tip, 'color' => 'gray'], 1);
                         $this->log('  ' . $c->username . ' 躺下 @ ' . $x . ',' . $y . ',' . $z);
                     } else {
                         $this->sendChat($c, ['text' => '现在还是白天，睡不着。', 'color' => 'gray'], 1);
@@ -4574,53 +4584,43 @@ final class Server
      * 实际加的饱和度 = food * modifier * 2，上限是当前饱食度。
      */
     private const FOOD_SAT = [
-        260 => 0.3,   // 苹果 4 -> 2.4
-        282 => 0.6,   // 蘑菇煲 6 -> 7.2
-        297 => 0.6,   // 面包 5 -> 6.0
-        319 => 0.3,   // 生猪排 3 -> 1.8
-        320 => 0.8,   // 熟猪排 8 -> 12.8
-        322 => 1.2,   // 金苹果 4 -> 9.6
-        349 => 0.1,   // 生鱼 2 -> 0.4
-        350 => 0.6,   // 熟鱼 5 -> 6.0
-        357 => 0.1,   // 曲奇 2 -> 0.4
-        360 => 0.3,   // 西瓜片 2 -> 1.2
-        363 => 0.3,   // 生牛肉 3 -> 1.8
-        364 => 0.8,   // 牛排 8 -> 12.8
-        365 => 0.3,   // 生鸡肉 2 -> 1.2
-        366 => 0.6,   // 熟鸡肉 6 -> 7.2
-        391 => 0.6,   // 胡萝卜 3 -> 3.6
-        392 => 0.3,   // 马铃薯 1 -> 0.6
-        393 => 0.6,   // 烤马铃薯 5 -> 6.0
-        394 => 0.3,   // 毒马铃薯 2 -> 1.2
-        400 => 0.3,   // 南瓜派 8 -> 4.8
-        423 => 0.3,   // 生羊肉 2 -> 1.2
-        424 => 0.8,   // 熟羊肉 6 -> 9.6
+        // saturationModifier（1.8）：饱和度 += food * mod * 2，上限为当前 food
+        260 => 0.3, 282 => 0.6, 297 => 0.6, 319 => 0.3, 320 => 0.8,
+        322 => 1.2, 349 => 0.1, 350 => 0.6, 357 => 0.1, 360 => 0.3,
+        363 => 0.3, 364 => 0.8, 365 => 0.3, 366 => 0.6, 367 => 0.1,
+        375 => 0.1, 391 => 0.6, 392 => 0.3, 393 => 0.6, 394 => 0.3,
+        396 => 1.2, 400 => 0.3, 411 => 0.1, 412 => 0.6, 413 => 0.6,
+        423 => 0.3, 424 => 0.8,
     ];
 
     private const FOOD = [
-        260 => 4,   // 苹果
-        282 => 6,   // 蘑菇煲
-        297 => 5,   // 面包
-        319 => 3,   // 生猪排
-        320 => 8,   // 熟猪排
-        322 => 4,   // 金苹果
-        349 => 2,   // 生鱼
-        350 => 5,   // 熟鱼
-        357 => 2,   // 曲奇
-        360 => 2,   // 西瓜片
-        363 => 3,   // 生牛肉
-        364 => 8,   // 牛排
-        365 => 2,   // 生鸡肉
-        366 => 6,   // 熟鸡肉
-        391 => 3,   // 胡萝卜
-        392 => 1,   // 马铃薯
-        393 => 5,   // 烤马铃薯
-        394 => 2,   // 毒马铃薯
-        400 => 8,   // 南瓜派
-        423 => 2,   // 生羊肉
-        424 => 6,   // 熟羊肉
-        393 => 2,   // 马铃薯
-        400 => 8,   // 南瓜派
+        260 => 4,  // 苹果
+        282 => 6,  // 蘑菇煲
+        297 => 5,  // 面包
+        319 => 3,  // 生猪排
+        320 => 8,  // 熟猪排
+        322 => 4,  // 金苹果
+        349 => 2,  // 生鱼
+        350 => 5,  // 熟鱼
+        357 => 2,  // 曲奇
+        360 => 2,  // 西瓜片
+        363 => 3,  // 生牛肉
+        364 => 8,  // 牛排
+        365 => 2,  // 生鸡肉
+        366 => 6,  // 熟鸡肉
+        367 => 4,  // 腐肉
+        375 => 2,  // 蜘蛛眼
+        391 => 3,  // 胡萝卜
+        392 => 1,  // 马铃薯
+        393 => 5,  // 烤马铃薯
+        394 => 2,  // 毒马铃薯
+        396 => 6,  // 金胡萝卜
+        400 => 8,  // 南瓜派
+        411 => 3,  // 生兔肉
+        412 => 5,  // 熟兔肉
+        413 => 10, // 兔肉煲
+        423 => 2,  // 生羊肉
+        424 => 6,  // 熟羊肉
     ];
 
     /** 右键食物：吃掉一个、回饱食度和血。 */
@@ -4684,7 +4684,17 @@ final class Server
         // modifier 每种食物不同，这里按 1.8 的数值表查
         $mod = self::FOOD_SAT[$itemId] ?? 0.6;
         $c->saturation = min((float) $c->food, $c->saturation + $food * $mod * 2.0);
-        // 【不要在这加血】吃东西只补饱食度和饱和度，回血由 tickFood 每 80 tick 处理。
+        // 特殊食物副作用（简化，无完整药水状态机）
+        if ($itemId === 322) { // 金苹果：少量直接回血
+            $c->health = min(20.0, $c->health + 4.0);
+        } elseif ($itemId === 367 && random_int(1, 100) <= 80) { // 腐肉 80% 饿更久：额外 exhaustion
+            $c->exhaustion = min(40.0, $c->exhaustion + 3.0);
+        } elseif ($itemId === 375 && random_int(1, 100) <= 100) { // 蜘蛛眼：轻伤
+            $c->health = max(1.0, $c->health - 2.0);
+        } elseif ($itemId === 394 && random_int(1, 100) <= 60) { // 毒马铃薯
+            $c->health = max(1.0, $c->health - 2.0);
+        }
+        // 回血仍由 tickFood 按饱食度推进
         $this->syncVitals($c);
         $this->log("  {$c->username} 吃了方块{$itemId}，饱食度 {$c->food}，血 {$c->health}");
     }
@@ -6023,28 +6033,53 @@ final class Server
             }
         }
 
-        // 睡觉：到点了就叫起来并跳到天亮
+        // 睡觉：所有可睡觉玩家都在床上且过了最短时间 → 跳到天亮
         if ($this->sleeping !== []) {
-            foreach ($this->sleeping as $eid => $until) {
-                if ($now < $until) {
+            $need = [];
+            foreach ($this->players() as $sp) {
+                // 创造/旁观不拦跳夜；生存/冒险必须上床
+                if ($sp->gamemode === 1 || $sp->gamemode === 3) {
                     continue;
                 }
-                unset($this->sleeping[$eid]);
-                // 跳夜：推进到下一个完整的 24000 tick 边界（原版行为）
-                $t = $this->world->timeOfDay() + 24000;
-                $this->world->setTimeOfDay($t - ($t % 24000));
+                $need[] = $sp->entityId;
+            }
+            $allInBed = true;
+            $ready = true;
+            if ($need === []) {
+                // 全员创造：谁上床谁到点就跳
+                foreach ($this->sleeping as $eid => $until) {
+                    if ($now < $until) {
+                        $ready = false;
+                        break;
+                    }
+                }
+            } else {
+                foreach ($need as $eid) {
+                    if (!isset($this->sleeping[$eid])) {
+                        $allInBed = false;
+                        break;
+                    }
+                    if ($now < $this->sleeping[$eid]) {
+                        $ready = false;
+                    }
+                }
+            }
+            if ($allInBed && $ready && $this->sleeping !== []) {
+                $tod = $this->world->timeOfDay() + 24000;
+                $this->world->setTimeOfDay($tod - ($tod % 24000));
                 foreach ($this->players() as $sv) {
                     $sv->send(self::C_TIME_UPDATE, (new Writer())
                         ->long($this->world->worldAge())
                         ->long($this->world->timeOfDay()));
                 }
-                foreach ($this->conns as $sp2) {
-                    if ($sp2->closed || $sp2->entityId !== $eid) {
-                        continue;
+                foreach ($this->players() as $sp2) {
+                    if (isset($this->sleeping[$sp2->entityId])) {
+                        $this->wakePlayer($sp2);
+                        $this->sendChat($sp2, ['text' => '一觉睡到天亮。', 'color' => 'green'], 1);
                     }
-                    $this->wakePlayer($sp2);
-                    $this->sendChat($sp2, ['text' => '一觉睡到天亮。', 'color' => 'green'], 1);
                 }
+                $this->sleeping = [];
+                $this->log('  全员睡觉，跳到天亮');
             }
         }
 
