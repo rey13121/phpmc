@@ -284,8 +284,51 @@ final class AnvilWorld
         // 磁盘上本来就没有这个区块：生成后落盘，下次直接读，不再临时生成。
         // 条目存在但读坏了就先不写，避免把可能有救的数据覆盖掉。
         $chunk->dirty = !$this->hasChunkEntry($cx, $cz);
+        $this->seedStructureLoot($chunk);
 
         return $this->chunks[$key] = $chunk;
+    }
+
+    /**
+     * 新生成区块：给结构里的箱子填基础战利品（地牢 / 矿道）。
+     * 已有 ChestStore 记录的不覆盖（玩家箱子安全）。
+     */
+    private function seedStructureLoot(Chunk $chunk): void
+    {
+        if ($this->chests === null) {
+            return;
+        }
+        $cx = $chunk->cx;
+        $cz = $chunk->cz;
+        $filled = 0;
+        foreach ($chunk->blockPositions(54) as [$x, $y, $z]) {
+            if ($y < 12 || $y > 55) {
+                continue;
+            }
+            if ($this->chests->has($x, $y, $z)) {
+                continue;
+            }
+            $pool = 'dungeon';
+            for ($dx = -2; $dx <= 2 && $pool === 'dungeon'; $dx++) {
+                for ($dz = -2; $dz <= 2; $dz++) {
+                    $nx = $x + $dx;
+                    $nz = $z + $dz;
+                    if (($nx >> 4) !== $cx || ($nz >> 4) !== $cz) {
+                        continue;
+                    }
+                    $id = $chunk->blockState($nx & 15, $y, $nz & 15) >> 4;
+                    if ($id === 66) {
+                        $pool = 'mineshaft';
+                        break;
+                    }
+                }
+            }
+            $this->chests->save($x, $y, $z, LootTables::rollChest($pool));
+            $filled++;
+        }
+        if ($filled > 0) {
+            error_log(sprintf('[phpmcs] 区块 %d,%d 结构箱子战利品 %d 个', $cx, $cz, $filled));
+        }
     }
 
     /** 磁盘上有没有这个区块的条目（不管能不能解析） */
