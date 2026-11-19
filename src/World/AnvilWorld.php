@@ -302,27 +302,43 @@ final class AnvilWorld
         $cz = $chunk->cz;
         $filled = 0;
         foreach ($chunk->blockPositions(54) as [$x, $y, $z]) {
-            if ($y < 12 || $y > 55) {
-                continue;
-            }
             if ($this->chests->has($x, $y, $z)) {
                 continue;
             }
+            // 结构生成箱子：地下偏地牢/矿道，地表偏村庄/铁匠
             $pool = 'dungeon';
-            for ($dx = -2; $dx <= 2 && $pool === 'dungeon'; $dx++) {
-                for ($dz = -2; $dz <= 2; $dz++) {
-                    $nx = $x + $dx;
-                    $nz = $z + $dz;
-                    if (($nx >> 4) !== $cx || ($nz >> 4) !== $cz) {
-                        continue;
-                    }
-                    $id = $chunk->blockState($nx & 15, $y, $nz & 15) >> 4;
-                    if ($id === 66) {
-                        $pool = 'mineshaft';
-                        break;
+            $hasRail = false;
+            $hasLavaOrFurnace = false;
+            for ($dx = -3; $dx <= 3; $dx++) {
+                for ($dz = -3; $dz <= 3; $dz++) {
+                    for ($dy = -1; $dy <= 2; $dy++) {
+                        $nx = $x + $dx;
+                        $ny = $y + $dy;
+                        $nz = $z + $dz;
+                        if ($ny < 0 || $ny > 255) {
+                            continue;
+                        }
+                        if (($nx >> 4) !== $cx || ($nz >> 4) !== $cz) {
+                            continue;
+                        }
+                        $id = $chunk->blockState($nx & 15, $ny, $nz & 15) >> 4;
+                        if ($id === 66) {
+                            $hasRail = true;
+                        }
+                        if ($id === 10 || $id === 11 || $id === 61 || $id === 62 || $id === 145) {
+                            $hasLavaOrFurnace = true;
+                        }
                     }
                 }
             }
+            if ($hasRail) {
+                $pool = 'mineshaft';
+            } elseif ($hasLavaOrFurnace) {
+                $pool = 'blacksmith';
+            } elseif ($y >= 56) {
+                $pool = 'village';
+            }
+
             $this->chests->save($x, $y, $z, LootTables::rollChest($pool));
             $filled++;
         }
@@ -623,8 +639,13 @@ final class AnvilWorld
                 if ($s2 < 0 || $s2 > 26) {
                     continue;
                 }
+                $rawId = $it->value['id']->value ?? 0;
+                // 1.8 原版 TE 可能是字符串名；本服用数字 short。两种都认。
+                if (is_string($rawId)) {
+                    $rawId = self::itemNameToId($rawId);
+                }
                 $slots[$s2] = [
-                    'id' => (int) ($it->value['id']->value ?? 0),
+                    'id' => (int) $rawId,
                     'count' => (int) ($it->value['Count']->value ?? 0),
                     'damage' => (int) ($it->value['Damage']->value ?? 0),
                     'ench' => $this->readEnch($it),

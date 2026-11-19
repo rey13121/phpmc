@@ -31,6 +31,31 @@ final class LootTables
         [368, 1, 1, 2],    // 末影珍珠（偏少）
     ];
 
+    /** 村庄铁匠铺箱子（偏装备/铁货） */
+    private const BLACKSMITH = [
+        [265, 1, 5, 15],   // 铁锭
+        [266, 1, 3, 5],    // 金锭
+        [264, 1, 1, 3],    // 钻石
+        [267, 1, 1, 5],    // 铁剑
+        [306, 1, 1, 5],    // 铁头盔
+        [307, 1, 1, 5],    // 铁胸甲
+        [308, 1, 1, 5],    // 铁腿
+        [309, 1, 1, 5],    // 铁靴
+        [257, 1, 1, 5],    // 铁镐
+        [258, 1, 1, 5],    // 铁斧
+        [256, 1, 1, 3],    // 铁铲
+        [259, 1, 1, 3],    // 打火石
+        [20, 1, 4, 5],     // 玻璃
+        [331, 1, 4, 5],    // 红石
+        [263, 3, 8, 10],   // 煤
+        [297, 1, 3, 10],   // 面包
+        [322, 1, 1, 1],    // 金苹果
+        [329, 1, 1, 1],    // 鞍
+        [417, 1, 1, 1],    // 铁马铠
+        [418, 1, 1, 1],    // 金马铠
+        [419, 1, 1, 1],    // 钻石马铠
+    ];
+
     /** 废弃矿道箱子 */
     private const MINESHAFT = [
         [66, 4, 8, 20],    // 铁轨
@@ -67,7 +92,7 @@ final class LootTables
 
     /**
      * 生成 27 格箱子内容。
-     * @param 'dungeon'|'mineshaft'|'village' $pool
+     * @param 'dungeon'|'mineshaft'|'village'|'blacksmith' $pool
      * @return array<int, array{id:int,count:int,damage:int}|null>
      */
     public static function rollChest(string $pool, ?int $seed = null): array
@@ -75,6 +100,7 @@ final class LootTables
         $table = match ($pool) {
             'mineshaft' => self::MINESHAFT,
             'village' => self::VILLAGE,
+            'blacksmith' => self::BLACKSMITH,
             default => self::DUNGEON,
         };
 
@@ -82,6 +108,7 @@ final class LootTables
         $rolls = match ($pool) {
             'mineshaft' => random_int(3, 8),
             'village' => random_int(2, 5),
+            'blacksmith' => random_int(3, 8),
             default => random_int(3, 7),
         };
 
