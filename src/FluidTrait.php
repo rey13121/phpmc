@@ -18,7 +18,7 @@ namespace PhpMc;
  */
 trait FluidTrait
 {
-    private const FLUID_REACH = [0 => 7, 1 => 3];      // 水 7 格 / 岩浆 3 格
+    private const FLUID_REACH = [0 => 7, 1 => 1];      // 水 7 格 / 岩浆 1 格（减少铁匠岩浆乱流）
     private const FLUID_TICK = 0.25;                    // 5 tick
 
     /** @var array 待更新的流体格子 [x, y, z, kind] */
@@ -328,6 +328,10 @@ trait FluidTrait
         }
 
         // ② 横向
+        // 岩浆源只允许向下，不横向流（避免结构里的熔岩池蔓延）
+        if ($kind === 1 && $meta === 0) {
+            return;
+        }
         // 注意：meta 8~15 是「下落水」，不能按 >= reach 直接 return，
         // 否则瀑布落到地面之后永远不会横向铺开（之前就是这个 bug）。
         if ($meta < 8 && $meta >= $reach) {

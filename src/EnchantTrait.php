@@ -122,23 +122,56 @@ trait EnchantTrait
                 $this->enchants[$k]['costs'] = [0, 0, 0];
                 $this->enchants[$k]['ids'] = [-1, -1, -1];
             } else {
-                // 三档：等级 1 / 2 / 3，消耗递增
-                // 三档各自随机抽一个（原版也是分档随机）
+                // 书架数量影响可选档位与消耗（1.8 近似：最多 15 本）
+                $books = $this->countBookshelves(
+                    (int) $c->enchantTable['x'],
+                    (int) $c->enchantTable['y'],
+                    (int) $c->enchantTable['z']
+                );
+                $power = min(15, $books);
+                // 三档基础消耗随书架提升
+                $costs = [
+                    max(1, (int) floor(1 + $power / 5)),
+                    max(5, (int) floor(5 + $power)),
+                    max(10, min(30, (int) floor(10 + $power * 1.5))),
+                ];
+                // 书架太少时锁住高档
+                if ($power < 2) {
+                    $costs[1] = 0;
+                    $costs[2] = 0;
+                } elseif ($power < 8) {
+                    $costs[2] = 0;
+                }
                 $ids = [];
                 $kind = $this->enchantKind($id);
                 for ($q = 0; $q < 3; $q++) {
+                    if ($costs[$q] <= 0) {
+                        $ids[] = -1;
+                        continue;
+                    }
                     $pick = $this->enchantFor($id);
-                    if ((self::ENCH_MAX[$pick] ?? 1) < $q + 1) {
+                    $wantLvl = $q + 1;
+                    if ((self::ENCH_MAX[$pick] ?? 1) < $wantLvl) {
                         foreach ((self::ENCH_POOL[$kind] ?? []) as $cand) {
-                            if ((self::ENCH_MAX[$cand] ?? 1) >= $q + 1) {
+                            if ((self::ENCH_MAX[$cand] ?? 1) >= $wantLvl) {
                                 $pick = $cand;
                                 break;
                             }
                         }
                     }
+                    // 书架多时提高抽到高阶附魔的机会
+                    if ($power >= 10 && random_int(0, 2) === 0) {
+                        $high = array_values(array_filter(
+                            self::ENCH_POOL[$kind] ?? [],
+                            static fn ($e) => (self::ENCH_MAX[$e] ?? 1) >= 3
+                        ));
+                        if ($high !== []) {
+                            $pick = $high[random_int(0, count($high) - 1)];
+                        }
+                    }
                     $ids[] = $pick;
                 }
-                $this->enchants[$k]['costs'] = [5, 15, 30];
+                $this->enchants[$k]['costs'] = $costs;
                 $this->enchants[$k]['ids'] = $ids;
             }
         }
@@ -178,6 +211,46 @@ trait EnchantTrait
         'boots'  => [0, 1, 3, 4, 7, 8, 34],
     ];
 
+    /** 统计附魔台周围书架（与空气间隔 1 格的 1.8 规则简化版） */
+    private function countBookshelves(int $tx, int $ty, int $tz): int
+    {
+        $n = 0;
+        for ($dx = -2; $dx <= 2; $dx++) {
+            for ($dz = -2; $dz <= 2; $dz++) {
+                for ($dy = 0; $dy <= 1; $dy++) {
+                    if ($dx === 0 && $dz === 0) {
+                        continue;
+                    }
+                    // 书架本身
+                    $bx = $tx + $dx;
+                    $by = $ty + $dy;
+                    $bz = $tz + $dz;
+                    if ($by < 0 || $by > 255) {
+                        continue;
+                    }
+                    $id = $this->world->chunk($bx >> 4, $bz >> 4)
+                        ->blockState($bx & 15, $by, $bz & 15) >> 4;
+                    if ($id !== 47) {
+                        continue;
+                    }
+                    // 书架与台子之间应有空气（简化：朝台方向一格空气）
+                    $sx = $tx + (int) ($dx === 0 ? 0 : ($dx > 0 ? 1 : -1));
+                    $sz = $tz + (int) ($dz === 0 ? 0 : ($dz > 0 ? 1 : -1));
+                    if ($sx === $tx && $sz === $tz) {
+                        $n++;
+                        continue;
+                    }
+                    $air = $this->world->chunk($sx >> 4, $sz >> 4)
+                        ->blockState($sx & 15, $ty, $sz & 15) >> 4;
+                    if ($air === 0) {
+                        $n++;
+                    }
+                }
+            }
+        }
+        return min(15, $n);
+    }
+
     /** 物品 → 类别（空串表示不可附魔） */
     private function enchantKind(int $itemId): string
     {
@@ -216,7 +289,8 @@ trait EnchantTrait
         }
         $pool = self::ENCH_POOL[$kind] ?? [];
 
-        return $pool === [] ? -1 : $pool[random_int(0, count($pool) - 1)];    }
+        return $pool === [] ? -1 : $pool[random_int(0, count($pool) - 1)];
+    }
 
     private function clickEnchant(Connection $c, int $slot, int $button, int $mode, ?array $cursor): void
     {

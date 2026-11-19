@@ -278,27 +278,62 @@ trait CraftingTrait
             }
         }
 
-        // 4) 烟花火箭（简化）：1 纸 + 1～3 火药 [+ 可选染料]
+        // 4) 烟花火箭：纸 + 火药 [+ 染料]
         $paper = 0;
         $gun = 0;
         $dye = 0;
+        $star = 0;
         $onlyOk = true;
+        $idsOnly = [];
         foreach ($items as $it) {
             $id = (int) $it['id'];
-            $c = (int) ($it['count'] ?? 1);
+            $idsOnly[] = $id;
             if ($id === 339) {
-                $paper += $c;
+                $paper++;
             } elseif ($id === 289) {
-                $gun += $c;
+                $gun++;
             } elseif ($id === 351) {
-                $dye += $c;
+                $dye++;
+            } elseif ($id === 402) {
+                $star++;
             } else {
                 $onlyOk = false;
             }
         }
-        // 格子里通常每格 count=1，按格数算
         if ($onlyOk && $paper >= 1 && $gun >= 1 && $n <= 5) {
-            return ['id' => 401, 'count' => 3, 'damage' => 0]; // 烟花火箭
+            return ['id' => 401, 'count' => 3, 'damage' => 0];
+        }
+        // 5) 烟花之星：火药 + 染料（可再加钻石/萤石等，简化）
+        if ($gun >= 1 && $dye >= 1 && $paper === 0 && $star === 0 && $n <= 4) {
+            $ok2 = true;
+            foreach ($items as $it) {
+                if (!in_array((int) $it['id'], [289, 351, 264, 348], true)) {
+                    $ok2 = false;
+                }
+            }
+            if ($ok2) {
+                return ['id' => 402, 'count' => 1, 'damage' => 0];
+            }
+        }
+        // 6) 火箭 + 星：仍输出火箭（星效果简化不存 NBT）
+        if ($star >= 1 && $paper >= 1 && $gun >= 1) {
+            return ['id' => 401, 'count' => 3, 'damage' => 0];
+        }
+        // 7) 旗帜：一棍 + 6 羊毛（颜色取羊毛 meta）
+        if ($n === 7) {
+            $sticks = 0;
+            $wools = [];
+            foreach ($items as $it) {
+                if ((int) $it['id'] === 280) {
+                    $sticks++;
+                } elseif ((int) $it['id'] === 35) {
+                    $wools[] = (int) ($it['damage'] ?? 0);
+                }
+            }
+            if ($sticks === 1 && count($wools) === 6) {
+                $color = $wools[0];
+                return ['id' => 425, 'count' => 1, 'damage' => $color];
+            }
         }
 
         return null;

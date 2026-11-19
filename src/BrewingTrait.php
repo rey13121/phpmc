@@ -23,17 +23,100 @@ trait BrewingTrait
     private bool $brewsLoaded = false;
     private float $lastBrewTick = 0.0;
 
-    /** 材料 id => [结果 damage, 消耗燃料] */
-    private const BREW_RECIPES = [
-        372 => 16,   // 地狱疣 -> 粗制的药水(16)
-        353 => 1,    // 糖 -> 迅捷(1)
-        348 => 2,    // 闪烁的西瓜 -> 治疗(2)（近似）
-        382 => 3,    // 河豚 -> 水下呼吸(3)
-        378 => 4,    // 岩浆膏 -> 抗火(4)
-        375 => 5,    // 蜘蛛眼 -> 剧毒(5)
-        370 => 7,    // 恶魂之泪 -> 再生(7)
-        373 => 0,    // 药水（还原）
+    /**
+     * 可作酿造材料的物品（用于“有没有配方”判断）。
+     * 真正结果由 brewTransform() 按「当前药水 damage + 材料」计算。
+     */
+    private const BREW_INGREDIENTS = [
+        372, // 地狱疣
+        353, // 糖
+        382, // 河豚
+        378, // 岩浆膏
+        375, // 蜘蛛眼
+        370, // 恶魂之泪
+        377, // 烈焰粉（力量；也作燃料）
+        396, // 金胡萝卜
+        414, // 兔脚
+        376, // 发酵蜘蛛眼
+        331, // 红石（延长）
+        348, // 荧石粉（增强）
+        289, // 火药（喷溅）
+        40,  // 红蘑菇（治疗近似用西瓜）
+        360, // 西瓜片备用
     ];
+
+    /**
+     * 1.8 常用药水链（damage 简化编码，与旧版兼容）：
+     * 0 水瓶 / 16 粗制 / 1 迅捷 / 2 治疗 / 3 水肺 / 4 抗火 / 5 毒 /
+     * 6 虚弱 / 7 再生 / 8 力量 / 9 夜视 / 10 跳跃
+     * bit6 延长 bit5 增强 bit14 喷溅（近似）
+     */
+    private function brewTransform(int $ingId, int $dmg): ?int
+    {
+        $base = $dmg & 0x1F;
+        $ext = ($dmg >> 6) & 1;
+        $enh = ($dmg >> 5) & 1;
+        $splash = ($dmg >> 14) & 1;
+
+        // 火药：变喷溅
+        if ($ingId === 289) {
+            return $base === 0 ? null : ($dmg | (1 << 14));
+        }
+        // 红石：延长（清增强）
+        if ($ingId === 331) {
+            if ($base === 0 || $base === 16) {
+                return null;
+            }
+            return ($base) | (1 << 6) | ($splash << 14);
+        }
+        // 荧石：增强（清延长）
+        if ($ingId === 348) {
+            if ($base === 0 || $base === 16) {
+                return null;
+            }
+            return ($base) | (1 << 5) | ($splash << 14);
+        }
+        // 发酵蜘蛛眼：腐蚀
+        if ($ingId === 376) {
+            $map = [1 => 5, 5 => 6, 7 => 5, 8 => 6, 2 => 5, 0 => 6, 16 => 6];
+            if (!isset($map[$base])) {
+                return null;
+            }
+            return $map[$base] | ($splash << 14);
+        }
+        // 地狱疣：水瓶 -> 粗制
+        if ($ingId === 372) {
+            return $base === 0 ? 16 : null;
+        }
+        // 只能从粗制往下做主效果
+        if ($base !== 16 && $base !== 0) {
+            // 已有主效果时，其它材料一般无效（红石/荧石/火药/腐蚀已处理）
+            return null;
+        }
+        if ($base === 0 && $ingId !== 372) {
+            return null; // 必须先粗制
+        }
+        $effect = match ($ingId) {
+            353 => 1,   // 糖 -> 迅捷
+            360, 382 => 3, // 河豚 -> 水肺（西瓜片不走这里）
+            378 => 4,   // 岩浆膏 -> 抗火
+            375 => 5,   // 蜘蛛眼 -> 毒
+            370 => 7,   // 恶魂之泪 -> 再生
+            377 => 8,   // 烈焰粉 -> 力量
+            396 => 9,   // 金胡萝卜 -> 夜视
+            414 => 10,  // 兔脚 -> 跳跃
+            348 => 2,   // 荧石在粗制上：治疗（兼容旧行为）
+            default => null,
+        };
+        if ($effect === null) {
+            return null;
+        }
+        // 河豚
+        if ($ingId === 382) {
+            $effect = 3;
+        }
+        return $effect | ($splash << 14);
+    }
 
     private function brewFile(): string
     {
@@ -231,7 +314,7 @@ trait BrewingTrait
                 $ing = $b['slots'][3] ?? null;
             }
             if ($ing === null || (int) $ing['id'] === 377
-                || !isset(self::BREW_RECIPES[$ing['id']]) || (int) $b['fuel'] <= 0) {
+                || !in_array((int) $ing['id'], self::BREW_INGREDIENTS, true) || (int) $b['fuel'] <= 0) {
                 continue;
             }
             // 三个槽里至少要有一个水瓶
@@ -262,10 +345,13 @@ trait BrewingTrait
             if ($b['brew'] >= 400) {
                 $b['brew'] = 0;
                 $b['fuel'] = max(0, (int) $b['fuel'] - 1);
-                $outDamage = self::BREW_RECIPES[$ing['id']];
                 for ($i = 0; $i < 3; $i++) {
                     $it = $b['slots'][$i] ?? null;
                     if (is_array($it) && (int) $it['id'] === 373) {
+                        $outDamage = $this->brewTransform((int) $ing['id'], (int) ($it['damage'] ?? 0));
+                        if ($outDamage === null) {
+                            continue;
+                        }
                         $b['slots'][$i] = ['id' => 373, 'count' => (int) $it['count'], 'damage' => $outDamage];
                     }
                 }

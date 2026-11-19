@@ -45,8 +45,57 @@ trait RedstoneTrait
         if ($id === 69 || $id === 77) {   // 拉杆 / 按钮
             return ($meta & 0x8) !== 0 ? 15 : 0;
         }
+        // 中继器(93 未锁定 / 94 锁定)：简化——有输入侧电就输出 15
+        if ($id === 93 || $id === 94) {
+            return $this->repeaterOutputPower($x, $y, $z, $meta);
+        }
+        // 比较器(149/150)：有侧向或后方输入则输出 15（简化，不做容器读数）
+        if ($id === 149 || $id === 150) {
+            return $this->maxNeighborWirePower($x, $y, $z) > 0
+                || $this->redstoneSourcePowerAdjacent($x, $y, $z) > 0 ? 15 : 0;
+        }
 
         return 0;
+    }
+
+    /** 中继器朝向 meta&0x3：0 北 1 东 2 南 3 西；输入来自朝向的反方向 */
+    private function repeaterOutputPower(int $x, int $y, int $z, int $meta): int
+    {
+        $dir = $meta & 3;
+        // 输出朝向 dir，输入在对面
+        $in = match ($dir) {
+            0 => [0, 1],   // 朝北，输入南
+            1 => [-1, 0],  // 朝东，输入西
+            2 => [0, -1],  // 朝南，输入北
+            default => [1, 0], // 朝西，输入东
+        };
+        $ix = $x + $in[0];
+        $iz = $z + $in[1];
+        // 输入侧导线或电源
+        $st = $this->world->chunk($ix >> 4, $iz >> 4)->blockState($ix & 15, $y, $iz & 15);
+        $iid = $st >> 4;
+        if ($this->isRedstoneWire($iid) && ($st & 0x0F) > 0) {
+            return 15;
+        }
+        if ($this->redstoneSourcePower($ix, $y, $iz) > 0) {
+            return 15;
+        }
+        // 强充能：输入侧固体背后有电源（简化：检查再外侧）
+        $ix2 = $ix + $in[0];
+        $iz2 = $iz + $in[1];
+        if ($this->redstoneSourcePower($ix2, $y, $iz2) > 0) {
+            return 15;
+        }
+        return 0;
+    }
+
+    private function redstoneSourcePowerAdjacent(int $x, int $y, int $z): int
+    {
+        $best = 0;
+        foreach ([[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]] as [$dx, $dy, $dz]) {
+            $best = max($best, $this->redstoneSourcePower($x + $dx, $y + $dy, $z + $dz));
+        }
+        return $best;
     }
 
     /** 某个红石粉格应该在的强度 */
@@ -59,7 +108,7 @@ trait RedstoneTrait
             }
         }
 
-        // 否则取相邻导线最大值 - 1
+        // 否则取相邻导线最大值 - 1，或朝向本格的中继器输出
         $best = 0;
         foreach ([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]] as [$dx, $dy, $dz]) {
             $nx = $x + $dx;
@@ -69,10 +118,24 @@ trait RedstoneTrait
                 continue;
             }
             $state = $this->world->chunk($nx >> 4, $nz >> 4)->blockState($nx & 15, $ny, $nz & 15);
-            if (!$this->isRedstoneWire($state >> 4)) {
+            $nid = $state >> 4;
+            if ($this->isRedstoneWire($nid)) {
+                $best = max($best, ($state & 0x0F) - 1);
                 continue;
             }
-            $best = max($best, ($state & 0x0F) - 1);
+            if ($nid === 93 || $nid === 94) {
+                $pow = $this->repeaterOutputPower($nx, $ny, $nz, $state & 0x0F);
+                if ($pow > 0) {
+                    // 中继器输出方向应对准本格
+                    $dir = ($state & 3);
+                    $out = match ($dir) {
+                        0 => [0, -1], 1 => [1, 0], 2 => [0, 1], default => [-1, 0],
+                    };
+                    if ($nx + $out[0] === $x && $nz + $out[1] === $z) {
+                        $best = max($best, 15);
+                    }
+                }
+            }
         }
 
         return max(0, $best);

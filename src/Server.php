@@ -4716,8 +4716,103 @@ final class Server
     ];
 
     /** 右键食物：吃掉一个、回饱食度和血。 */
+    /** @var array<int, array{x:float,y:float,z:float,vx:float,vy:float,vz:float,until:float,owner:int}> */
+    private array $fireworks = [];
+
+    private function launchFirework(Connection $c): void
+    {
+        $slot = 36 + $c->heldSlot;
+        $held = $c->inventory[$slot] ?? null;
+        if (!is_array($held) || (int) $held['id'] !== 401) {
+            return;
+        }
+        if ($c->gamemode !== 1) {
+            $held['count'] = (int) $held['count'] - 1;
+            if ($held['count'] <= 0) {
+                unset($c->inventory[$slot]);
+            } else {
+                $c->inventory[$slot] = $held;
+            }
+            $this->sendInventorySlot($c, $slot, $c->inventory[$slot] ?? null);
+        }
+        $yaw = deg2rad($c->yaw);
+        $pitch = deg2rad($c->pitch);
+        $vx = -sin($yaw) * cos($pitch) * 0.8;
+        $vy = 0.6 + max(0.0, -sin($pitch)) * 0.5;
+        $vz = cos($yaw) * cos($pitch) * 0.8;
+        $eid = $this->nextEntityId++;
+        $this->fireworks[$eid] = [
+            'x' => $c->x,
+            'y' => $c->y + 1.2,
+            'z' => $c->z,
+            'vx' => $vx,
+            'vy' => $vy,
+            'vz' => $vz,
+            'until' => microtime(true) + 1.2,
+            'owner' => $c->entityId,
+        ];
+        // 轻微推动玩家（烟花助推）
+        $c->x += $vx * 0.5;
+        $c->y += 0.35;
+        $c->z += $vz * 0.5;
+        $c->send(self::C_POS_LOOK, (new Writer())
+            ->double($c->x)->double($c->y)->double($c->z)
+            ->float($c->yaw)->float($c->pitch)->byte(0));
+        // 生成火箭实体（Object 76）
+        foreach ($this->players() as $p) {
+            $p->send(self::C_SPAWN_OBJECT, (new Writer())
+                ->varInt($eid)
+                ->byte(76)
+                ->int((int) ($this->fireworks[$eid]['x'] * 32))
+                ->int((int) ($this->fireworks[$eid]['y'] * 32))
+                ->int((int) ($this->fireworks[$eid]['z'] * 32))
+                ->byte(0)->byte(0)
+                ->int(0));
+        }
+        $this->log("  {$c->username} 发射烟花 eid={$eid}");
+    }
+
+    private function tickFireworks(float $now): void
+    {
+        if ($this->fireworks === []) {
+            return;
+        }
+        foreach ($this->fireworks as $eid => $fw) {
+            $fw['x'] += $fw['vx'];
+            $fw['y'] += $fw['vy'];
+            $fw['z'] += $fw['vz'];
+            $fw['vy'] += 0.04;
+            $this->fireworks[$eid] = $fw;
+            foreach ($this->players() as $p) {
+                $p->send(self::C_ENTITY_TELEPORT, (new Writer())
+                    ->varInt($eid)
+                    ->int((int) ($fw['x'] * 32))
+                    ->int((int) ($fw['y'] * 32))
+                    ->int((int) ($fw['z'] * 32))
+                    ->byte(0)->byte(0)->bool(false));
+            }
+            if ($now >= $fw['until']) {
+                // 爆炸包
+                foreach ($this->players() as $p) {
+                    $p->send(self::C_EXPLOSION, (new Writer())
+                        ->float((float) $fw['x'])->float((float) $fw['y'])->float((float) $fw['z'])
+                        ->float(0.5)->int(0)
+                        ->float(0.0)->float(0.0)->float(0.0));
+                    $p->send(self::C_DESTROY_ENTITIES, (new Writer())
+                        ->varInt(1)->varInt($eid));
+                }
+                unset($this->fireworks[$eid]);
+            }
+        }
+    }
+
     private function useItem(Connection $c, int $itemId): void
     {
+        // 烟花火箭：消耗一个，向前上方发射实体并短暂升空（1.8 无鞘翅，给一点冲击）
+        if ($itemId === 401) {
+            $this->launchFirework($c);
+            return;
+        }
         $food = self::FOOD[$itemId] ?? 0;
         if ($food <= 0) {
             return;
@@ -6363,6 +6458,7 @@ final class Server
         }
 
         $this->tickWeather($now);
+        $this->tickFireworks($now);
 
         // 每秒同步一次时间，客户端天空才会真的昼→夜
         if ($now - $this->lastTimeSync >= 1.0) {
