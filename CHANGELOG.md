@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.4 — 2026-11-19
+
+- **动态合成**：同种工具/盔甲双件修复；皮革甲 + 染料染色（display.color）；地图 + 空地图复制（简化）
+- **指令**：`/gamerule keepInventory`、`/gamerule naturalRegeneration`
+- 槽位 NBT 支持皮革 `display.color`
+
 ## v0.4.3 — 2026-11-19
 
 - **文档**：`docs/ARCHITECTURE.md` 代码地图；`docs/MAINTAINING.md` 维护约定；`docs/FEATURES.md` 功能对照；README / HANDOFF / ROADMAP 对齐当前版本

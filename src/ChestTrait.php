@@ -24,15 +24,18 @@ trait ChestTrait
             return pack('n', 0xFFFF);   // short -1 = 空槽
         }
 
-        // 附魔 / 自定义名字都要带 NBT
+        // 附魔 / 自定义名字 / 皮革颜色
         $nbt = "\x00";
+        $display = [];
         if (!empty($item['name'])) {
-            // 铁砧改过的名字存在 display.Name 里（1.8 就是这个名字）
-            $nbt = Nbt::write(Tag::compound([
-                'display' => Tag::compound([
-                    'Name' => Tag::str((string) $item['name']),
-                ]),
-            ]));
+            $display['Name'] = Tag::str((string) $item['name']);
+        }
+        if (isset($item['color'])) {
+            $display['color'] = Tag::int((int) $item['color']);
+        }
+        $root = [];
+        if ($display !== []) {
+            $root['display'] = Tag::compound($display);
         }
         if (!empty($item['ench'])) {
             $list = [];
@@ -42,17 +45,10 @@ trait ChestTrait
                     'lvl' => Tag::short((int) $e['lvl']),
                 ]);
             }
-            // Nbt::write 已经包含根标签头（type + 名称长度 + 名称），
-            // 再手动加 chr(10) 会让客户端把 0x0A00 读成字符串长度 2560 而断线。
-            $root = [
-                'ench' => Tag::list(10, $list),
-                'RepairCost' => Tag::int(1),
-            ];
-            if (!empty($item['name'])) {
-                $root['display'] = Tag::compound([
-                    'Name' => Tag::str((string) $item['name']),
-                ]);
-            }
+            $root['ench'] = Tag::list(10, $list);
+            $root['RepairCost'] = Tag::int(1);
+        }
+        if ($root !== []) {
             $nbt = Nbt::write(Tag::compound($root));
         }
 

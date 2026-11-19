@@ -3460,6 +3460,9 @@ final class Server
     /** 世界规则 naturalRegeneration，1.8 默认 true */
     private bool $naturalRegen = true;
 
+    /** 死亡是否保留背包（/gamerule keepInventory） */
+    private bool $keepInventory = false;
+
     private array $xpStore = [];
     private bool $xpLoaded = false;
 
@@ -4466,6 +4469,39 @@ final class Server
                 }
                 $this->sendChat($c, ['text' => "{$msg} @ {$bx2},{$by2},{$bz2}——看 F3 的 Block 行", 'color' => 'aqua'], 1);
                 $this->log("  /blocktest {$what} @ {$bx2},{$by2},{$bz2} state={$st}（伪装已暂停）");
+                break;
+
+            case 'gamerule':
+                $rule = strtolower(trim((string) ($args[0] ?? '')));
+                $val = strtolower(trim((string) ($args[1] ?? '')));
+                if ($rule === 'keepinventory') {
+                    if ($val === 'true' || $val === '1') {
+                        $this->keepInventory = true;
+                    } elseif ($val === 'false' || $val === '0') {
+                        $this->keepInventory = false;
+                    }
+                    $this->sendChat($c, [
+                        'text' => 'gamerule keepInventory = ' . ($this->keepInventory ? 'true' : 'false'),
+                        'color' => 'green',
+                    ], 1);
+                    break;
+                }
+                if ($rule === 'naturalregeneration') {
+                    if ($val === 'true' || $val === '1') {
+                        $this->naturalRegen = true;
+                    } elseif ($val === 'false' || $val === '0') {
+                        $this->naturalRegen = false;
+                    }
+                    $this->sendChat($c, [
+                        'text' => 'gamerule naturalRegeneration = ' . ($this->naturalRegen ? 'true' : 'false'),
+                        'color' => 'green',
+                    ], 1);
+                    break;
+                }
+                $this->sendChat($c, [
+                    'text' => '用法：/gamerule keepInventory <true|false> 或 naturalRegeneration <true|false>',
+                    'color' => 'yellow',
+                ], 1);
                 break;
 
             case 'timeset':
@@ -5703,8 +5739,8 @@ final class Server
         $c->health = 0.0;
         $this->broadcastChat($c->username . ' 死了', 0);
 
-        // 生存模式掉落全部物品（创造不掉）
-        if ($c->gamemode !== 1 && $c->gamemode !== 3) {
+        // 生存模式掉落全部物品（创造不掉；keepInventory 时不掉）
+        if ($c->gamemode !== 1 && $c->gamemode !== 3 && !$this->keepInventory) {
             $dx = (int) floor($c->x);
             $dy = (int) floor($c->y);
             $dz = (int) floor($c->z);

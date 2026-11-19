@@ -195,7 +195,138 @@ trait CraftingTrait
             }
         }
 
+        return self::matchDynamic($cells);
+    }
+
+    /**
+     * 动态合成：修装备、皮甲染色、空地图复制（简化 1.8 行为）。
+     * @param list<?array> $cells 非空格子列表或整格数组均可
+     */
+    private static function matchDynamic(array $cells): ?array
+    {
+        $items = [];
+        foreach ($cells as $it) {
+            if (is_array($it) && isset($it['id']) && (int) ($it['count'] ?? 1) > 0) {
+                $items[] = $it;
+            }
+        }
+        $n = count($items);
+        if ($n < 2) {
+            return null;
+        }
+
+        // 1) 同种可损坏物品两件 → 合成修复
+        if ($n === 2) {
+            $a = $items[0];
+            $b = $items[1];
+            if ((int) $a['id'] === (int) $b['id'] && self::isRepairable((int) $a['id'])) {
+                $max = self::maxDamage((int) $a['id']);
+                $da = (int) ($a['damage'] ?? 0);
+                $db = (int) ($b['damage'] ?? 0);
+                if ($max > 0 && ($da > 0 || $db > 0)) {
+                    $uses = ($max - $da) + ($max - $db) + (int) floor($max * 0.05);
+                    $newDmg = max(0, $max - $uses);
+                    $out = [
+                        'id' => (int) $a['id'],
+                        'count' => 1,
+                        'damage' => $newDmg,
+                    ];
+                    // 保留第一件附魔（简化，不做冲突合并）
+                    if (!empty($a['ench'])) {
+                        $out['ench'] = $a['ench'];
+                    } elseif (!empty($b['ench'])) {
+                        $out['ench'] = $b['ench'];
+                    }
+                    return $out;
+                }
+            }
+        }
+
+        // 2) 皮革盔甲 + 染料 → 染色（display.color）
+        $leather = null;
+        $dyeMeta = null;
+        $other = 0;
+        foreach ($items as $it) {
+            $id = (int) $it['id'];
+            if (in_array($id, [298, 299, 300, 301], true)) {
+                $leather = $it;
+            } elseif ($id === 351) {
+                $dyeMeta = (int) ($it['damage'] ?? 0);
+            } else {
+                $other++;
+            }
+        }
+        if ($leather !== null && $dyeMeta !== null && $other === 0 && $n === 2) {
+            $out = [
+                'id' => (int) $leather['id'],
+                'count' => 1,
+                'damage' => (int) ($leather['damage'] ?? 0),
+                'color' => self::dyeMetaToRgb($dyeMeta),
+            ];
+            if (!empty($leather['ench'])) {
+                $out['ench'] = $leather['ench'];
+            }
+            return $out;
+        }
+
+        // 3) 地图复制：已写地图(358) + 空地图(395) → 两张已写地图（简化：输出一张 358）
+        // 原版会复制数据；这里至少不拦截合成
+        if ($n === 2) {
+            $ids = [(int) $items[0]['id'], (int) $items[1]['id']];
+            sort($ids);
+            if ($ids === [358, 395]) {
+                return ['id' => 358, 'count' => 2, 'damage' => (int) (($items[0]['id'] === 358 ? $items[0] : $items[1])['damage'] ?? 0)];
+            }
+        }
+
         return null;
+    }
+
+    private static function isRepairable(int $id): bool
+    {
+        return self::maxDamage($id) > 0;
+    }
+
+    /** 1.8 常见工具/武器/盔甲最大损伤值 */
+    private static function maxDamage(int $id): int
+    {
+        static $map = [
+            268 => 59, 269 => 59, 270 => 59, 271 => 59, 290 => 59,
+            272 => 131, 273 => 131, 274 => 131, 275 => 131, 291 => 131,
+            267 => 250, 256 => 250, 257 => 250, 258 => 250, 292 => 250,
+            276 => 1561, 277 => 1561, 278 => 1561, 279 => 1561, 293 => 1561,
+            283 => 32, 284 => 32, 285 => 32, 286 => 32, 294 => 32,
+            298 => 55, 299 => 80, 300 => 75, 301 => 65,
+            306 => 165, 307 => 240, 308 => 225, 309 => 195,
+            310 => 363, 311 => 528, 312 => 495, 313 => 429,
+            314 => 77, 315 => 112, 316 => 105, 317 => 91,
+            302 => 165, 303 => 240, 304 => 225, 305 => 195,
+            261 => 384, 359 => 238, 346 => 64,
+        ];
+        return $map[$id] ?? 0;
+    }
+
+    /** 1.8 染料 meta → 皮革 RGB（近似原版色） */
+    private static function dyeMetaToRgb(int $meta): int
+    {
+        return match ($meta & 15) {
+            0 => 0x1D1D21,   // 黑
+            1 => 0xB02E26,   // 红
+            2 => 0x5E7C16,   // 绿
+            3 => 0x835432,   // 棕
+            4 => 0x3C44AA,   // 蓝
+            5 => 0x8932B8,   // 紫
+            6 => 0x169C9C,   // 青
+            7 => 0x9D9D97,   // 浅灰
+            8 => 0x474F52,   // 灰
+            9 => 0xF38BAA,   // 粉
+            10 => 0x80C71F,  // 黄绿
+            11 => 0xFED83D,  // 黄
+            12 => 0x3AB3DA,  // 淡蓝
+            13 => 0xC74EBD,  // 品红
+            14 => 0xF9801D,  // 橙
+            default => 0xF9FFFE, // 白
+        };
     }
 
     /** 裁掉四周空行空列，返回 [格子, 高, 宽] */
@@ -313,7 +444,7 @@ trait CraftingTrait
             }
         }
 
-        return null;
+        return self::matchDynamic($g);
     }
 
     /**
@@ -326,6 +457,10 @@ trait CraftingTrait
         $hit = self::matchTable($g);
         if ($hit !== null) {
             return $hit;
+        }
+        $dyn = self::matchDynamic($g);
+        if ($dyn !== null) {
+            return $dyn;
         }
 
         // 床：一排 3 个羊毛，正下方一排 3 个木板。
