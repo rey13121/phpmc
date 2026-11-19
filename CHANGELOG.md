@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4.3 — 2026-11-19
+
+- **文档**：`docs/ARCHITECTURE.md` 代码地图；`docs/MAINTAINING.md` 维护约定；`docs/FEATURES.md` 功能对照；README / HANDOFF / ROADMAP 对齐当前版本
+
 ## v0.4.2 — 2026-11-19
 
 - **食物表**：补全腐肉/蜘蛛眼/金胡萝卜/兔肉等；修正重复键；金苹果回血、腐肉/毒马铃薯/蜘蛛眼副作用

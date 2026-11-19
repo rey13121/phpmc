@@ -4,167 +4,94 @@
 
 - 单进程 + `stream_select` 事件循环
 - **零扩展依赖**（不需要 sockets / 特殊 pecl）
-- 直接读写 Anvil 存档（`.mca`），单机也能打开
+- 直接读写 Anvil 存档（`.mca`）
 
-适合学习 Minecraft 协议、或在只有 PHP 的环境里跑一个轻量 1.8.9 服。
+当前版本见根目录 [`VERSION`](VERSION)。变更见 [`CHANGELOG.md`](CHANGELOG.md)，规划见 [`ROADMAP.md`](ROADMAP.md)。
 
 ---
 
-## 快速开始（适合新手）
+## 快速开始（新手）
 
-### 1. 环境要求
+### 环境
 
-- PHP **8.0+**（推荐 8.1 / 8.2 / 8.3）
-- 命令行能执行 `php`
-- 可选：Python 3（用来跑 `tools/` 下的协议测试脚本）
-
-检查：
+- PHP **8.0+**（推荐 8.1～8.3）
+- 命令行可执行 `php`
 
 ```bash
 php -v
 ```
 
-### 2. 启动服务端
+### 启动
 
 **Linux / macOS：**
 
 ```bash
 chmod +x start.sh
 ./start.sh
+# 或：./start.sh 25565 "我的 PHP 服" world
 ```
 
-或指定参数：
+**Windows：** 双击 `start.bat`，或 `.\start.ps1`
 
-```bash
-./start.sh 25565 "我的 PHP 服" world
-```
-
-**Windows：**
-
-双击 `start.bat`，或在 PowerShell 里：
-
-```powershell
-.\start.ps1
-```
-
-**直接用 PHP：**
+**直接 PHP：**
 
 ```bash
 php bin/server.php 25565 "PHP 写的 1.8.9" world
 ```
 
-- 默认监听 `0.0.0.0:25565`
-- 没有 `world/` 目录会自动按 Anvil 格式新建一份标准存档
-- 改配置请编辑 `server.properties`（端口、MOTD、存档名、视距、模式等），改完需重启
+CLI 参数优先于 `server.properties`。改配置后需重启。
 
-### 3. 客户端连接
+### 客户端
 
-1. 启动官方 **Minecraft 1.8.9**（或支持 1.8.9 协议的启动器）
-2. 多人游戏 → 直接连接 → 输入 `127.0.0.1`（本机）或服务器 IP
-3. 离线模式，随便起名字即可
-
-> 视距默认 3，公网带宽压力较小。想更远可在 `server.properties` 里改 `view-distance`（会更吃内存和流量）。
+官方 **Minecraft 1.8.9**，离线模式，连接 `127.0.0.1:25565`（或服务器 IP）。
 
 ---
 
-## 现在已经能做什么（v0.4.0）
+## 现在已经能做什么
 
-- 离线登录、Keep-Alive、聊天、Tab 列表、皮肤
-- 区块收发、移动、挖/放方块、掉落物拾取
-- **多人可见**：其他玩家模型、手持物品与盔甲同步
-- 箱子 / 末影箱 / 工作台 / 熔炉熔炼 / 附魔台 / 铁砧 / 酿造台（基础）
-- 2×2 + 3×3 合成（大量 1.8 配方）
-- 生存：生命、饥饿、经验、摔落/火焰等伤害
-- **盔甲点数减伤 + 盔甲耐久**；保护类附魔；武器附魔（锋利/击退/火焰附加等）
-- 生物生成与简单 AI、刷怪笼、弓箭
-- 流体扩散、部分红石、农作物
-- 下界传送门 + `/nether`；末地相关逻辑
-- Anvil 存档读写、近似原版地形
-- 村庄（含铁匠铺/教堂/图书馆）、地牢与废弃矿道、结构箱战利品
-- 生物 AI（追击/苦力怕爆炸/骷髅射箭等）、JSON 合成全表
-- 指令：`/gm` `/spawn` `/tp` `/give` `/clear` `/kill` `/timeset` `/save` `/reload` `/help` …
-- 插件示例（`plugins/example.php`）
-- 简单 WebSocket 支持（见 `src/WebSocket.php`）
+- 离线登录、聊天、Tab、皮肤；多人可见与装备同步
+- 挖/放方块、掉落与拾取、Anvil 存档
+- 箱子 / 末影箱 / 工作台 / 熔炉 / 附魔台 / 铁砧 / 酿造（基础）
+- JSON 合成表（`data/recipes-1.8.9.json`）
+- 生存：生命、饥饿与饱和、经验；**死亡掉落与死亡界面**；盔甲减伤与耐久
+- 附魔效果（工具/武器/护甲常见项）
+- 生物 AI（追击、苦力怕爆炸、骷髅射箭等）、刷怪笼
+- 村庄（含铁匠铺等）、地牢、废弃矿道与结构箱战利品
+- 下界传送门；床（全员睡觉跳白天）
+- 指令：`/gm` `/spawn` `/tp` `/give` `/clear` `/kill` `/timeset` `/save` `/help` …
 
-常用命令：
-
-```
-/gm 0|1     生存 / 创造
-/spawn
-/who
-/help
-/block x y z
-/save
-/reload
-```
+未完成与简化项见 [`ROADMAP.md`](ROADMAP.md) 与 [`docs/FEATURES.md`](docs/FEATURES.md)。
 
 ---
 
-## 还缺 / 不完善的地方
+## 文档索引（维护必看）
 
-- 生存模式完整挖掘计时与正确掉落概率
-- 完整生物 AI、刷怪、战斗
-- 红石电路完整模拟
-- 下界 / 末地完整体验
-- 熔炉冶炼进度、盔甲穿戴、更多配方
-- 区块 zlib 压缩（当前未压缩，流量偏大）
-- 在线模式（加密 + 正版验证）
-- 洞穴 / 矿脉 / 结构生成仍有接缝或不完整的可能
-
-详细技术交接与已知坑见 `HANDOFF.md` 和 `CHEST_TE_ISSUE.md`。
-
----
-
-## 测试脚本（不依赖真客户端）
-
-```bash
-python tools/play_test.py     # 登录 / 区块 / 聊天 / 两人互见
-python tools/dig_test.py      # 挖放方块
-python tools/drop_test.py     # 掉落物 + 拾取
-python tools/action_test.py   # 丢物品、挥手
-python tools/skin_test.py     # 皮肤属性
-python tools/check_save.py    # 校验 .mca 和 level.dat
-```
-
----
-
-## 项目结构（简要）
-
-| 路径 | 说明 |
+| 文档 | 内容 |
 |------|------|
-| `bin/server.php` | 启动入口 |
-| `src/Server.php` | 核心网络循环、玩家、包处理（很大） |
-| `src/*Trait.php` | 功能模块（箱子、合成、熔炉、生物、红石……） |
-| `src/World/` | 世界、区块、地形生成 |
-| `src/Protocol.php` | 协议编解码 |
-| `server.properties` | 配置 |
-| `start.sh` / `start.bat` / `start.ps1` | 启动脚本 |
-| `tools/` | 协议测试脚本 |
-| `plugins/` | 简单插件示例 |
-| `HANDOFF.md` | 详细开发交接笔记 |
+| [CHANGELOG.md](CHANGELOG.md) | 版本变更记录 |
+| [ROADMAP.md](ROADMAP.md) | 已规划未完成 |
+| [docs/FEATURES.md](docs/FEATURES.md) | 功能对照表 |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 代码地图与踩坑点 |
+| [docs/MAINTAINING.md](docs/MAINTAINING.md) | 改代码/发版约定 |
+| [HANDOFF.md](HANDOFF.md) | 早期交接笔记（部分过时，以 docs + CHANGELOG 为准） |
+| [docs/](docs/) | 专题：协议、流体、饱食度、群系等 |
 
 ---
 
-## 1.8 协议两个容易踩的坑
+## 目录结构（简）
 
-1. **实体元数据**：一个字节 = 高 3 位类型 + 低 5 位索引（1.9 才拆成两个字节）。
-2. **Spawn Object**：只有 `data > 0` 时才后面跟速度三个 short；写成 0 时物品会卡在出生点。
-
-写错通常不报错，只是画面不对或客户端崩溃。
-
----
-
-## 下一步可以怎么完善
-
-1. **稳定性**：修箱子重进渲染、区块接缝、生存挖掘计时
-2. **功能**：补更多合成配方、熔炉完整流程、简单生物 AI
-3. **性能**：给区块数据加 zlib 压缩
-4. **易用性**：简单 Web 状态页 / 管理接口、更好的日志与错误提示
-5. **现代化**：拆分过大的 `Server.php`、补类型注解与简单单元测试
-
-有问题或想优先做哪一块，直接说即可。
-
+```
+bin/server.php      入口
+src/                服务端与 Trait
+src/World/          存档、地形、结构、战利品
+data/               配方等数据
+docs/               维护文档
+start.sh            Linux 启动
+server.properties   配置
+```
 
 ---
 
-更多变更见 [CHANGELOG.md](CHANGELOG.md)，规划见 [ROADMAP.md](ROADMAP.md)。
+## 许可证与来源
+
+基于社区项目演进；提交历史见 GitHub 标签 `v0.2.0` 起。

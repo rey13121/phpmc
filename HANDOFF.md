@@ -1,5 +1,10 @@
 # PHPMCS 1.8.9 Server - Handoff Notes
 
+> **维护提示（2026-11-19）**  
+> 本文保留早期交接细节，部分「未实现」列表已过时。  
+> 请以根目录 `VERSION` / `CHANGELOG.md` / `ROADMAP.md` 以及 `docs/ARCHITECTURE.md`、`docs/FEATURES.md`、`docs/MAINTAINING.md` 为准。
+
+
 Date: 2026-10-28（地形生成大修见第 10 节）
 Project root: `d:\codextest\bigfish\phpmcs`
 Runtime: PHP 8 (CLI), Windows, single-process `stream_select` server
