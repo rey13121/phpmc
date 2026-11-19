@@ -187,17 +187,20 @@ Vanilla limitation worth remembering: 1.8's `BlockChest.canPlaceBlockAt` refuses
 - Terrain: 早期版本是自写的 value/Perlin 高度图 + 气候群系；现在已改为原版 1.8 的 3D 密度场（见第 10 节），群系换成原版群系层。旧的高度图代码（`terrainHeightAt()/biomeAt()/fbm()/perlin2()`）已不再被调用，属于死代码，保留未删。
 - Newly generated chunks are marked dirty and saved; old chunks are not regenerated. New biomes appear only in chunks generated after this change.
 
-## 5. Known issues / limitations
+## 5. Known issues / limitations（2026-11-19 更新）
 
-1. Existing inventory may already contain many duplicated oak-plank stacks from older bugs. Full-window resync prevents **new** duplication but does not delete existing stacks. The player should throw away/clear them, or the world inventory JSON can be edited manually while the server is stopped.
-2. No furnace smelting UI or recipes; furnace block is placeable but not usable yet.
-3. Armor slots are sent but equip logic is not implemented.
-4. No full vanilla recipe set, no brewing/enchanting/anvil.
-5. Terrain 已按原版密度场重写，但仍是“近似”：没有村庄/要塞/矿道/地牢/群系混合平滑，1.8 的 `ChunkProviderGenerate` 也还有地表石块噪声等细节没移植。见第 10 节。
-6. No entity/mob AI; only item entities and other players.
-7. Chunks are uncompressed; network use is high; zlib support is a future optimization.
-8. No online-mode encryption; offline mode only.
-9. `Set Slot`/`Window Items` are chatty because of the full resync; acceptable for a small server, but worth optimizing later.
+**已解决（勿再当缺口）：** 熔炉 UI、盔甲穿戴与点数减伤、附魔台/铁砧/酿造基础、生物生成与简单 AI、下界传送、`/clear` `/give`、玩家装备同步（Entity Equipment 0x04）。
+
+仍开放：
+
+1. 旧存档里可能还有早期复制的木板堆，用 `/clear` 清掉即可。
+2. 配方表仍非完整 1.8 全集；`data/recipes-1.8.9.json` 尚未接到运行时匹配器。
+3. 地形近似原版：村庄/要塞/矿道/地牢等结构完成度有限。
+4. 生物 AI 为简化版（追击/掉落/亡灵日晒），无完整寻路与中立态度表。
+5. 1.8 区块包本身无网络 zlib；带宽优化靠视距与分帧发送。
+6. 仅离线模式，无 online-mode 加密。
+7. 容器全量 resync 较吵，小服可接受。
+8. 红石/流体/末地龙等为可玩原型，边界情况可能与原版有出入。
 
 ## 6. Protocol gotchas for future work
 

@@ -140,7 +140,8 @@ final class Connection
     public bool $flying = false;
     /** 手上拿的是快捷栏第几格（0-8），客户端切物品时会告诉我们 */
     public int $heldSlot = 0;
-    public float $health = 20.0;
+
+    public float $health = 20.0;
     public int $food = 20;
     /** 上一次同步给客户端的血量/饱食度/是否饥饿，用于「只在变化时发包」 */
     public float $lastHealth = -1.0;
@@ -242,6 +243,8 @@ final class Server
     private const C_JOIN_GAME = 0x01;
     private const C_CHAT = 0x02;
     private const C_SPAWN_POSITION = 0x05;
+    /** S->C Entity Equipment：别人手上的东西 / 盔甲 */
+    private const C_ENTITY_EQUIPMENT = 0x04;
     private const C_POS_LOOK = 0x08;
     private const C_SPAWN_PLAYER = 0x0C;
     private const C_DESTROY_ENTITIES = 0x13;
@@ -1412,6 +1415,138 @@ final class Server
             ->byte(self::angle($who->pitch))
             ->short(0)
             ->unsignedByte(0x7F));
+        // Spawn 包里的 currentItem 在 1.8 已废弃为 0；装备靠 0x04 单独同步
+        $this->sendEquipmentTo($to, $who);
+    }
+
+    /**
+     * 1.8 Entity Equipment 槽位：
+     *   0 手持 / 1 靴 / 2 腿 / 3 胸 / 4 头
+     * 对应玩家背包：held / 8 / 7 / 6 / 5
+     */
+    private function sendEquipmentTo(Connection $to, Connection $who): void
+    {
+        $held = $who->inventory[36 + $who->heldSlot] ?? null;
+        $map = [
+            0 => $held,
+            1 => $who->inventory[8] ?? null,
+            2 => $who->inventory[7] ?? null,
+            3 => $who->inventory[6] ?? null,
+            4 => $who->inventory[5] ?? null,
+        ];
+        foreach ($map as $slot => $item) {
+            $to->send(self::C_ENTITY_EQUIPMENT, (new Writer())
+                ->varInt($who->entityId)
+                ->short($slot)
+                ->raw($this->slotBytes($item)));
+        }
+    }
+
+    /** 把装备变化广播给附近其他玩家（不含自己） */
+    private function broadcastEquipment(Connection $who): void
+    {
+        foreach ($this->players() as $p) {
+            if ($p === $who) {
+                continue;
+            }
+            $this->sendEquipmentTo($p, $who);
+        }
+    }
+
+    /** 盔甲基础点数（1.8 无 toughness） */
+    private static function armorPointsFor(int $itemId): int
+    {
+        return match ($itemId) {
+            // 皮革
+            298 => 1, 299 => 3, 300 => 2, 301 => 1,
+            // 锁链
+            302 => 2, 303 => 5, 304 => 4, 305 => 1,
+            // 铁
+            306 => 2, 307 => 6, 308 => 5, 309 => 2,
+            // 钻石
+            310 => 3, 311 => 8, 312 => 6, 313 => 3,
+            // 金
+            314 => 2, 315 => 5, 316 => 3, 317 => 1,
+            default => 0,
+        };
+    }
+
+    private function totalArmorPoints(Connection $c): int
+    {
+        $pts = 0;
+        foreach ([5, 6, 7, 8] as $slot) {
+            $it = $c->inventory[$slot] ?? null;
+            if ($it !== null) {
+                $pts += self::armorPointsFor((int) $it['id']);
+            }
+        }
+
+        return min(20, $pts);
+    }
+
+    /**
+     * 1.8 盔甲减伤：damage *= (1 - min(20, max(armor/5, armor - damage/2)) / 25)
+     * 返回扣完后的伤害，至少为 0。
+     */
+    private function applyArmorReduction(Connection $c, int $dmg): int
+    {
+        if ($dmg <= 0) {
+            return 0;
+        }
+        $armor = $this->totalArmorPoints($c);
+        if ($armor <= 0) {
+            return $dmg;
+        }
+        $reduction = min(20, max((int) floor($armor / 5), $armor - (int) floor($dmg / 2))) / 25.0;
+
+        return max(0, (int) ceil($dmg * (1.0 - $reduction)));
+    }
+
+    /** 受伤时扣盔甲耐久（原版：每件按伤害分摊，至少 1） */
+    private function damageArmor(Connection $c, int $dmg): void
+    {
+        if ($dmg <= 0 || $c->gamemode === 1) {
+            return;
+        }
+        $changed = false;
+        foreach ([5, 6, 7, 8] as $slot) {
+            $it = $c->inventory[$slot] ?? null;
+            if ($it === null) {
+                continue;
+            }
+            // 不可破坏（Unbreaking）已在 shouldConsumeDurability 里处理
+            if (!$this->shouldConsumeDurability($it)) {
+                continue;
+            }
+            $it['damage'] = (int) ($it['damage'] ?? 0) + max(1, (int) ceil($dmg / 4));
+            $maxDmg = match ((int) $it['id']) {
+                298, 299, 300, 301 => 55,   // 皮革约值
+                302, 303, 304, 305 => 165,
+                306, 307, 308, 309 => 240,
+                310, 311, 312, 313 => 528,
+                314, 315, 316, 317 => 112,
+                default => 100,
+            };
+            // 头胸腿靴各自真实最大耐久更细，这里用材质上限近似
+            $maxExact = match ((int) $it['id']) {
+                298 => 55, 299 => 80, 300 => 75, 301 => 65,
+                302 => 165, 303 => 240, 304 => 225, 305 => 195,
+                306 => 165, 307 => 240, 308 => 225, 309 => 195,
+                310 => 363, 311 => 528, 312 => 495, 313 => 429,
+                314 => 77, 315 => 112, 316 => 105, 317 => 91,
+                default => $maxDmg,
+            };
+            if ($it['damage'] >= $maxExact) {
+                unset($c->inventory[$slot]);
+            } else {
+                $c->inventory[$slot] = $it;
+            }
+            $changed = true;
+            $this->sendInventorySlot($c, $slot, $c->inventory[$slot] ?? null);
+        }
+        if ($changed) {
+            $this->broadcastEquipment($c);
+        }
     }
 
     // ---------------- 游戏内 ----------------
@@ -2113,6 +2248,7 @@ final class Server
 
             case 0x09: // 切换手上的快捷栏格
                 $c->heldSlot = max(0, min(8, $r->readShort()));
+                $this->broadcastEquipment($c);
                 break;
 
             case 0x0A: // 挥手：广播给别人，不然对面看不到你在打
@@ -2232,6 +2368,7 @@ final class Server
                                 $c->inventory[$ws] = $heldAttack;
                                 $this->sendInventorySlot($c, $ws, $heldAttack);
                             }
+                            $this->broadcastEquipment($c);
                         }
                         break;
                     }
@@ -2726,6 +2863,7 @@ final class Server
                     $c->inventory[$heldSlot] = $held;
                     $this->sendInventorySlot($c, $heldSlot, $held);
                 }
+                $this->broadcastEquipment($c);
             }
         }
 
@@ -3845,6 +3983,8 @@ final class Server
                 $this->sendChat($c, ['text' => '/block x y z  问服务器这个坐标是什么方块', 'color' => 'gray'], 1);
                 $this->sendChat($c, ['text' => '/save  立刻存盘', 'color' => 'gray'], 1);
                 $this->sendChat($c, ['text' => '/reload  丢掉内存缓存、按磁盘重发（验证存盘）', 'color' => 'gray'], 1);
+                $this->sendChat($c, ['text' => '/clear  清空背包（含盔甲与合成格）', 'color' => 'gray'], 1);
+                $this->sendChat($c, ['text' => '/give <id> [数量] [损伤值]  给物品', 'color' => 'gray'], 1);
                 break;
 
             case 'gm':
@@ -4381,6 +4521,32 @@ final class Server
                 break;
 
             default:
+            case 'clear':
+                $c->inventory = [];
+                $c->craftGrid = [null, null, null, null];
+                $c->craft9 = array_fill(0, 9, null);
+                $c->cursor = null;
+                $this->sendPlayerInventory($c);
+                $this->sendCursor($c);
+                $this->broadcastEquipment($c);
+                $this->sendChat($c, ['text' => '已清空背包', 'color' => 'green'], 1);
+                $this->log("  {$c->username} /clear");
+                break;
+
+            case 'give':
+                $id = (int) ($parts[0] ?? 0);
+                $count = max(1, min(64, (int) ($parts[1] ?? 1)));
+                $dmgv = max(0, (int) ($parts[2] ?? 0));
+                if ($id <= 0 || $id > 450) {
+                    $this->sendChat($c, ['text' => '用法：/give <物品id> [数量] [损伤值]', 'color' => 'yellow'], 1);
+                    break;
+                }
+                $this->giveItem($c, $id, $count, $dmgv);
+                $this->sendPlayerInventory($c);
+                $this->sendChat($c, ['text' => "已给予 {$count}×#{$id}", 'color' => 'green'], 1);
+                $this->log("  {$c->username} /give {$id} x{$count}");
+                break;
+
                 $this->sendChat($c, ['text' => "未知命令 /{$cmd}，试试 /help", 'color' => 'red'], 1);
         }
     }
@@ -5226,6 +5392,7 @@ final class Server
                         empty($worn['ench']) ? [] : ['ench' => $worn['ench']]);
                 }
                 $this->sendPlayerInventory($c);
+                $this->broadcastEquipment($c);
 
                 return;
             }
@@ -5251,6 +5418,7 @@ final class Server
             $c->cursor = $newCursor;
             $this->sendPlayerInventory($c);
             $this->sendCursor($c);
+            $this->broadcastEquipment($c);
 
             return;
         }
@@ -5470,19 +5638,30 @@ final class Server
         if ($dmg <= 0 || $c->gamemode === 1) {
             return;
         }
-        // 保护 / 火焰保护 / 摔落保护 / 爆炸保护 / 弹射物保护：每级约 4%，总上限 80%
+        // 1) 盔甲点数减伤（1.8 公式）
+        $beforeArmor = $dmg;
+        $dmg = $this->applyArmorReduction($c, $dmg);
+        // 2) 保护类附魔：每级约 4%，总上限 80%
         $factor = $this->protectionFactor($c, $kind);
-        if ($factor > 0) {
+        if ($factor > 0 && $dmg > 0) {
             $dmg = max(1, (int) round($dmg * (1 - $factor)));
+        }
+        // 3) 盔甲耐久（按减伤前的伤害磨损）
+        $this->damageArmor($c, $beforeArmor);
+        if ($dmg <= 0) {
+            $this->syncVitals($c);
+            return;
         }
         $c->health = max(0.0, $c->health - $dmg);
         $this->addExhaustion($c, 0.3);   // 原版：每次受伤 0.3
         $this->syncVitals($c);
-        $this->log(sprintf('  %s 掉血 %d，剩 %.1f（来源 %s）',
+        $this->log(sprintf('  %s 掉血 %d，剩 %.1f（来源 %s，盔甲前 %d）',
             $c->username, $dmg, $c->health,
-            debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2)[1]['function'] ?? '?'));
+            debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2)[1]['function'] ?? '?',
+            $beforeArmor));
 
         if ($c->health <= 0.0) {
+            $this->broadcastChat($c->username . ' 死了', 0);
             // 重生点：睡过的床优先，否则世界出生点
             if ($c->bedSpawn !== null) {
                 $c->x = (float) $c->bedSpawn[0];
