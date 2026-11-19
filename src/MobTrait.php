@@ -312,10 +312,11 @@ trait MobTrait
             // 末影人对视激怒（玩家视线对准、距离 < 64、未戴南瓜）
             if ($type === 58 && !$isHostile) {
                 foreach ($this->players() as $pp) {
-                    if ($pp->gamemode === 1 || $pp->gamemode === 3 || $pp->portalDim !== ($m['dim'] ?? 0)) {
-                        // portalDim may not be on mob - skip dim check if unset
-                    }
                     if ($pp->gamemode === 1 || $pp->gamemode === 3) {
+                        continue;
+                    }
+                    // 末影人只存在于主世界逻辑层；玩家不在主世界则跳过
+                    if (($pp->portalDim ?? 0) !== 0) {
                         continue;
                     }
                     $helm = $pp->inventory[5] ?? null;

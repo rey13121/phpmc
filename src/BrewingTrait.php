@@ -30,7 +30,8 @@ trait BrewingTrait
     private const BREW_INGREDIENTS = [
         372, // 地狱疣
         353, // 糖
-        382, // 河豚
+        382, // 闪烁的西瓜
+        349, // 鱼（水肺近似）
         378, // 岩浆膏
         375, // 蜘蛛眼
         370, // 恶魂之泪
@@ -41,8 +42,6 @@ trait BrewingTrait
         331, // 红石（延长）
         348, // 荧石粉（增强）
         289, // 火药（喷溅）
-        40,  // 红蘑菇（治疗近似用西瓜）
-        360, // 西瓜片备用
     ];
 
     /**
@@ -98,22 +97,18 @@ trait BrewingTrait
         }
         $effect = match ($ingId) {
             353 => 1,   // 糖 -> 迅捷
-            360, 382 => 3, // 河豚 -> 水肺（西瓜片不走这里）
+            382 => 2,   // 闪烁的西瓜 -> 治疗
+            349 => 3,   // 鱼/河豚近似 -> 水肺
             378 => 4,   // 岩浆膏 -> 抗火
             375 => 5,   // 蜘蛛眼 -> 毒
             370 => 7,   // 恶魂之泪 -> 再生
             377 => 8,   // 烈焰粉 -> 力量
             396 => 9,   // 金胡萝卜 -> 夜视
             414 => 10,  // 兔脚 -> 跳跃
-            348 => 2,   // 荧石在粗制上：治疗（兼容旧行为）
             default => null,
         };
         if ($effect === null) {
             return null;
-        }
-        // 河豚
-        if ($ingId === 382) {
-            $effect = 3;
         }
         return $effect | ($splash << 14);
     }
@@ -313,8 +308,11 @@ trait BrewingTrait
                     : null;
                 $ing = $b['slots'][3] ?? null;
             }
-            if ($ing === null || (int) $ing['id'] === 377
-                || !in_array((int) $ing['id'], self::BREW_INGREDIENTS, true) || (int) $b['fuel'] <= 0) {
+            // 注意：烈焰粉既可作燃料也可作力量材料；燃料已在上方处理，
+            // 这里不再无条件跳过 377，否则永远酿不出力量药水。
+            if ($ing === null
+                || !in_array((int) $ing['id'], self::BREW_INGREDIENTS, true)
+                || (int) $b['fuel'] <= 0) {
                 continue;
             }
             // 三个槽里至少要有一个水瓶

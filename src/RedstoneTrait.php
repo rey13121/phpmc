@@ -23,6 +23,7 @@ trait RedstoneTrait
 {
     /** 防止 changeBlock 和红石更新互相递归 */
     private bool $redstoneBusy = false;
+    private int $redstoneDepth = 0;
 
     private function isRedstoneWire(int $id): bool
     {
@@ -45,14 +46,25 @@ trait RedstoneTrait
         if ($id === 69 || $id === 77) {   // 拉杆 / 按钮
             return ($meta & 0x8) !== 0 ? 15 : 0;
         }
-        // 中继器(93 未锁定 / 94 锁定)：简化——有输入侧电就输出 15
+        // 中继器/比较器：限制递归深度，避免对射中继器互相调用爆栈
         if ($id === 93 || $id === 94) {
-            return $this->repeaterOutputPower($x, $y, $z, $meta);
+            if ($this->redstoneDepth >= 8) {
+                return 0;
+            }
+            $this->redstoneDepth++;
+            $pow = $this->repeaterOutputPower($x, $y, $z, $meta);
+            $this->redstoneDepth--;
+            return $pow;
         }
-        // 比较器(149/150)：有侧向或后方输入则输出 15（简化，不做容器读数）
         if ($id === 149 || $id === 150) {
-            return $this->maxNeighborWirePower($x, $y, $z) > 0
-                || $this->redstoneSourcePowerAdjacent($x, $y, $z) > 0 ? 15 : 0;
+            if ($this->redstoneDepth >= 8) {
+                return 0;
+            }
+            $this->redstoneDepth++;
+            $pow = ($this->maxNeighborWirePower($x, $y, $z) > 0
+                || $this->redstoneSourcePowerAdjacent($x, $y, $z) > 0) ? 15 : 0;
+            $this->redstoneDepth--;
+            return $pow;
         }
 
         return 0;
@@ -77,14 +89,30 @@ trait RedstoneTrait
         if ($this->isRedstoneWire($iid) && ($st & 0x0F) > 0) {
             return 15;
         }
-        if ($this->redstoneSourcePower($ix, $y, $iz) > 0) {
+        // 输入侧电源：只认「简单电源」和导线，避免中继器互递归
+        $simple = $this->simpleRedstoneSourcePower($ix, $y, $iz);
+        if ($simple > 0) {
             return 15;
         }
-        // 强充能：输入侧固体背后有电源（简化：检查再外侧）
         $ix2 = $ix + $in[0];
         $iz2 = $iz + $in[1];
-        if ($this->redstoneSourcePower($ix2, $y, $iz2) > 0) {
+        if ($this->simpleRedstoneSourcePower($ix2, $y, $iz2) > 0) {
             return 15;
+        }
+        return 0;
+    }
+
+    /** 拉杆/按钮/火把/红石块，不含中继器 */
+    private function simpleRedstoneSourcePower(int $x, int $y, int $z): int
+    {
+        $state = $this->world->chunk($x >> 4, $z >> 4)->blockState($x & 15, $y, $z & 15);
+        $id = $state >> 4;
+        $meta = $state & 0x0F;
+        if ($id === 152 || $id === 76) {
+            return 15;
+        }
+        if ($id === 69 || $id === 77) {
+            return ($meta & 0x8) !== 0 ? 15 : 0;
         }
         return 0;
     }

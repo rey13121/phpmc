@@ -5877,12 +5877,7 @@ final class Server
         }
     }
 
-    /**
-     * 玩家死亡：掉落背包、发 0 血量（客户端死亡界面）、等 Client Status 重生。
-     * 不再立刻 0x07 重生（那会跳过死亡画面）。
-     */
-
-    /** 右键生物：打火石充能苦力怕；小麦/种子/胡萝卜繁殖 */
+    /** 右键生物：打火石充能苦力怕；驯狼/骑马；喂食繁殖 */
     private function interactMob(Connection $c, int $eid): void
     {
         if (!isset($this->mobs[$eid]) || !empty($this->mobs[$eid]['dead'])) {
@@ -5936,7 +5931,9 @@ final class Server
             return;
         }
         // 已驯服狼：空手右键坐下/起来
-        if ($type === 95 && !empty($m['tamed']) && ($m['owner'] ?? '') === $c->username && $hid === 0) {
+        if ($type === 95 && !empty($m['tamed'])
+            && strtolower((string) ($m['owner'] ?? '')) === strtolower($c->username)
+            && $hid === 0) {
             $m['sitting'] = empty($m['sitting']);
             $this->sendChat($c, ['text' => !empty($m['sitting']) ? '狼坐下了' : '狼跟你走了', 'color' => 'gray'], 1);
             return;
@@ -6056,14 +6053,29 @@ final class Server
                 if (!is_array($it) || !isset($it['id']) || (int) ($it['count'] ?? 0) <= 0) {
                     continue;
                 }
-                $this->spawnDrop(
-                    $dx,
-                    max(0, $dy),
-                    $dz,
+                $extra = [];
+                if (!empty($it['ench'])) {
+                    $extra['ench'] = $it['ench'];
+                }
+                if (!empty($it['name'])) {
+                    $extra['name'] = $it['name'];
+                }
+                if (isset($it['color'])) {
+                    $extra['color'] = $it['color'];
+                }
+                // 用 throwItem 保留附魔 NBT（spawnDrop 不带 extra）
+                $this->throwItem(
+                    $dx + 0.5,
+                    max(0, $dy) + 0.5,
+                    $dz + 0.5,
                     (int) $it['id'],
                     (int) $it['count'],
                     (int) ($it['damage'] ?? 0),
-                    null   // 掉在地上，不强制回原主人
+                    random_int(-900, 900),
+                    1600,
+                    random_int(-900, 900),
+                    0.5,
+                    $extra
                 );
             }
             $c->inventory = [];
