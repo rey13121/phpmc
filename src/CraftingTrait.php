@@ -9,15 +9,117 @@ namespace PhpMc;
  */
 trait CraftingTrait
 {
-    /**
-     * 2x2 合成配方。只做生存最常用的几个；输出必须和客户端本地配方一致，
-     * 否则客户端会先显示结果、点击时被服务端打回去。
-     *
-     * @param array<int,array{id:int,count:int,damage:int}|null> $g 行优先 2x2
-     */
+    /** @var list<array{width:int,height:int,mirror:bool,ing:list<?array{id:int,meta:int}>,out:array{id:int,count:int,meta:int}}>|null */
+    private static ?array $jsonShaped = null;
+
+    /** 加载 data/recipes-1.8.9.json（只读一次） */
+    private static function ensureJsonRecipes(): void
+    {
+        if (self::$jsonShaped !== null) {
+            return;
+        }
+        self::$jsonShaped = [];
+        $path = dirname(__DIR__) . '/data/recipes-1.8.9.json';
+        if (!is_file($path)) {
+            return;
+        }
+        $raw = @file_get_contents($path);
+        if ($raw === false) {
+            return;
+        }
+        $data = json_decode($raw, true);
+        if (!is_array($data) || !isset($data['crafting']) || !is_array($data['crafting'])) {
+            return;
+        }
+        foreach ($data['crafting'] as $r) {
+            if (($r['type'] ?? '') !== 'shaped') {
+                continue;
+            }
+            $w = (int) ($r['width'] ?? 0);
+            $h = (int) ($r['height'] ?? 0);
+            $ings = $r['ingredients'] ?? [];
+            if ($w < 1 || $h < 1 || count($ings) < $w * $h) {
+                continue;
+            }
+            $flat = [];
+            for ($i = 0; $i < $w * $h; $i++) {
+                $it = $ings[$i] ?? null;
+                if ($it === null || !isset($it['id'])) {
+                    $flat[] = null;
+                } else {
+                    $flat[] = ['id' => (int) $it['id'], 'meta' => (int) ($it['meta'] ?? 0)];
+                }
+            }
+            $out = $r['output'] ?? null;
+            if (!is_array($out) || !isset($out['id'])) {
+                continue;
+            }
+            self::$jsonShaped[] = [
+                'width' => $w,
+                'height' => $h,
+                'mirror' => (bool) ($r['mirror_horizontal'] ?? true),
+                'ing' => $flat,
+                'out' => [
+                    'id' => (int) $out['id'],
+                    'count' => (int) ($out['count'] ?? 1),
+                    'meta' => (int) ($out['meta'] ?? 0),
+                ],
+            ];
+        }
+    }
 
     /**
-     * 用反编译得到的完整配方表匹配。
+     * JSON 有形状配方：与裁剪后的网格比，支持水平镜像。
+     * @param list<?array> $trim
+     */
+    private static function matchJsonShaped(array $trim, int $h, int $w): ?array
+    {
+        self::ensureJsonRecipes();
+        foreach (self::$jsonShaped as $r) {
+            if ($r['height'] !== $h || $r['width'] !== $w) {
+                continue;
+            }
+            $variants = [false];
+            if ($r['mirror']) {
+                $variants[] = true;
+            }
+            foreach ($variants as $mirror) {
+                $ok = true;
+                for ($row = 0; $row < $h && $ok; $row++) {
+                    for ($col = 0; $col < $w; $col++) {
+                        $srcCol = $mirror ? ($w - 1 - $col) : $col;
+                        $need = $r['ing'][$row * $w + $srcCol] ?? null;
+                        $cell = $trim[$row * $w + $col] ?? null;
+                        if ($need === null) {
+                            if ($cell !== null) {
+                                $ok = false;
+                                break;
+                            }
+                            continue;
+                        }
+                        if ($cell === null
+                            || (int) $cell['id'] !== $need['id']
+                            || (int) ($cell['damage'] ?? 0) !== $need['meta']) {
+                            $ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ($ok) {
+                    return [
+                        'id' => $r['out']['id'],
+                        'count' => $r['out']['count'],
+                        'damage' => $r['out']['meta'],
+                    ];
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * 用反编译配方表 + JSON 全表匹配。
      * $g 是 3x3 行优先的格子（2x2 的调用方把它摆在左上角）。
      * 返回 [id, count, damage] 或 null。
      */
@@ -31,6 +133,12 @@ trait CraftingTrait
 
         // 有形状：裁掉空行空列后逐格比
         [$trim, $h, $w] = self::trimGrid($cells, 3, 3);
+        if ($h > 0 && $w > 0) {
+            $jsonHit = self::matchJsonShaped($trim, $h, $w);
+            if ($jsonHit !== null) {
+                return $jsonHit;
+            }
+        }
         foreach ([...RecipeTable::SHAPED, ...RecipeTable::SHAPED_EXTRA, ...RecipeTable::SHAPED_TOOLS] as [$out, $pat, $keys]) {
             $ph = count($pat);
             $pw = max(array_map('strlen', $pat));
@@ -40,8 +148,9 @@ trait CraftingTrait
             foreach ([false, true] as $mirror) {
                 $ok = true;
                 for ($r = 0; $r < $ph && $ok; $r++) {
+                    $rowPat = $mirror ? strrev($pat[$r]) : $pat[$r];
                     for ($c = 0; $c < $pw; $c++) {
-                        $ch = $pat[$r][$c] ?? ' ';
+                        $ch = $rowPat[$c] ?? ' ';
                         $cell = $trim[$r * $w + $c] ?? null;
                         if ($ch === ' ') {
                             if ($cell !== null) {
@@ -59,10 +168,6 @@ trait CraftingTrait
                             $ok = false;
                             break;
                         }
-                    }
-                    if ($ok && $mirror) {
-                        // 镜像：把图案左右翻过来再比一次
-                        $pat[$r] = strrev($pat[$r]);
                     }
                 }
                 if ($ok) {

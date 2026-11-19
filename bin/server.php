@@ -25,6 +25,8 @@ require __DIR__ . '/../src/World/CaveCarver.php';
 require __DIR__ . '/../src/World/CaveGenerator.php';
 require __DIR__ . '/../src/World/OreDecorator.php';
 require __DIR__ . '/../src/World/VillageGenerator.php';
+require __DIR__ . '/../src/World/DungeonGenerator.php';
+require __DIR__ . '/../src/World/MineshaftGenerator.php';
 foreach (glob(__DIR__ . '/../src/World/Layer/*.php') as $__f) {
     require $__f;
 }
