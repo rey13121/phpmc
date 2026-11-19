@@ -67,7 +67,7 @@ php bin/server.php 25565 "PHP 写的 1.8.9" world
 
 ---
 
-## 现在已经能做什么（v0.3.0）
+## 现在已经能做什么（v0.4.0）
 
 - 离线登录、Keep-Alive、聊天、Tab 列表、皮肤
 - 区块收发、移动、挖/放方块、掉落物拾取
@@ -80,6 +80,8 @@ php bin/server.php 25565 "PHP 写的 1.8.9" world
 - 流体扩散、部分红石、农作物
 - 下界传送门 + `/nether`；末地相关逻辑
 - Anvil 存档读写、近似原版地形
+- 村庄（含铁匠铺/教堂/图书馆）、地牢与废弃矿道、结构箱战利品
+- 生物 AI（追击/苦力怕爆炸/骷髅射箭等）、JSON 合成全表
 - 指令：`/gm` `/spawn` `/tp` `/give` `/clear` `/kill` `/timeset` `/save` `/reload` `/help` …
 - 插件示例（`plugins/example.php`）
 - 简单 WebSocket 支持（见 `src/WebSocket.php`）
@@ -161,3 +163,8 @@ python tools/check_save.py    # 校验 .mca 和 level.dat
 5. **现代化**：拆分过大的 `Server.php`、补类型注解与简单单元测试
 
 有问题或想优先做哪一块，直接说即可。
+
+
+---
+
+更多变更见 [CHANGELOG.md](CHANGELOG.md)，规划见 [ROADMAP.md](ROADMAP.md)。
