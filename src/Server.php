@@ -168,6 +168,9 @@ final class Connection
     /** @var array<int, array{id:int,count:int,damage:int}> 槽位 => 物品 */
     public array $inventory = [];
 
+    /** 已死、等客户端点「重生」（Client Status 0x16） */
+    public bool $dead = false;
+
     // 位置（脚底）
     public float $x = 0.5;
     public float $y = 4.0;
@@ -1553,6 +1556,11 @@ final class Server
 
     private function handlePlay(Connection $c, int $id, Reader $r): void
     {
+        // 死亡后只接受：Keep Alive / Client Status(重生) / Client Settings
+        if ($c->dead && $id !== 0x00 && $id !== 0x16 && $id !== 0x15) {
+            return;
+        }
+
         // 记最近 12 个包 id，附魔丢失时能对上「那一刻客户端发了什么」
         $c->pktLog[] = $id;
         if (count($c->pktLog) > 12) {
@@ -2521,6 +2529,13 @@ final class Server
 
             case 0x15: // Client Settings
                 $r->readString(16);
+                break;
+
+            case 0x16: // Client Status：0=重生 1=请求统计 2=开物品栏成就
+                $action = $r->varInt();
+                if ($action === 0) {
+                    $this->respawnPlayer($c);
+                }
                 break;
 
             default:
@@ -5661,47 +5676,112 @@ final class Server
             $beforeArmor));
 
         if ($c->health <= 0.0) {
-            $this->broadcastChat($c->username . ' 死了', 0);
-            // 重生点：睡过的床优先，否则世界出生点
-            if ($c->bedSpawn !== null) {
-                $c->x = (float) $c->bedSpawn[0];
-                $c->y = (float) $c->bedSpawn[1];
-                $c->z = (float) $c->bedSpawn[2];
-            } else {
-                [$sx, $sy, $sz] = $this->world->spawnPoint();
-                $c->x = (float) $sx + 0.5;
-                $c->y = (float) $sy;
-                $c->z = (float) $sz + 0.5;
+            $this->killPlayer($c);
+        }
+    }
+
+    /**
+     * 玩家死亡：掉落背包、发 0 血量（客户端死亡界面）、等 Client Status 重生。
+     * 不再立刻 0x07 重生（那会跳过死亡画面）。
+     */
+    private function killPlayer(Connection $c): void
+    {
+        if ($c->dead) {
+            return;
+        }
+        $c->dead = true;
+        $c->health = 0.0;
+        $this->broadcastChat($c->username . ' 死了', 0);
+
+        // 生存模式掉落全部物品（创造不掉）
+        if ($c->gamemode !== 1 && $c->gamemode !== 3) {
+            $dx = (int) floor($c->x);
+            $dy = (int) floor($c->y);
+            $dz = (int) floor($c->z);
+            foreach ($c->inventory as $slot => $it) {
+                if (!is_array($it) || !isset($it['id']) || (int) ($it['count'] ?? 0) <= 0) {
+                    continue;
+                }
+                $this->spawnDrop(
+                    $dx,
+                    max(0, $dy),
+                    $dz,
+                    (int) $it['id'],
+                    (int) $it['count'],
+                    (int) ($it['damage'] ?? 0),
+                    null   // 掉在地上，不强制回原主人
+                );
             }
-
-            $c->health = 20.0;
-            $c->food = 20;
-            $c->saturation = 5.0;
-            $c->fallFrom = -1.0;
-            $c->portalDim = 0;
-
-            // 客户端收到 0x07 会把世界整个丢掉重建：区块缓存要清，
-            // 背包也要重发，否则背包窗口里全是空的，得等他跨一次维度才恢复。
-            $c->sentChunks = [];
-            $c->chunkQueue = [];
-
-            $c->send(self::C_RESPAWN, (new Writer())
-                ->int(0)                       // 主世界
-                ->byte(1)                      // 难度 normal
-                ->byte($c->gamemode)
-                ->string('default'));
-            $c->send(self::C_POS_LOOK, (new Writer())
-                ->double($c->x)->double($c->y)->double($c->z)
-                ->float(0)->float(0)->byte(0));
-            $this->queueChunks($c);
-            $this->sendHealth($c);
+            $c->inventory = [];
+            $c->cursor = null;
+            $c->craftGrid = [null, null, null, null];
+            if (isset($c->craft9) && is_array($c->craft9)) {
+                $c->craft9 = array_fill(0, 9, null);
+            }
+            $this->world->rememberInventory($c->username, []);
             $this->sendPlayerInventory($c);
             $this->sendCursor($c);
-
-            $this->log(sprintf('  %s 死亡，重生到 %.1f,%.1f,%.1f%s',
-                $c->username, $c->x, $c->y, $c->z,
-                $c->bedSpawn !== null ? '（床上）' : '（世界出生点）'));
         }
+
+        // 经验：死亡清空进度（简化，不生成经验球）
+        $c->xpLevel = 0;
+        $c->xpProgress = 0.0;
+        $c->xpTotal = 0;
+        $this->xpStore[strtolower($c->username)] = 0;
+        $c->send(self::C_SET_EXPERIENCE, (new Writer())
+            ->float(0.0)->varInt(0)->varInt(0));
+
+        $c->lastHealth = -1.0;
+        $this->syncVitals($c, true);   // health=0 → 客户端死亡界面
+
+        $this->log(sprintf('  %s 死亡 @ %.1f,%.1f,%.1f，等待重生',
+            $c->username, $c->x, $c->y, $c->z));
+    }
+
+    /** Client Status 请求重生后调用 */
+    private function respawnPlayer(Connection $c): void
+    {
+        if (!$c->dead && $c->health > 0.0) {
+            return;
+        }
+        $c->dead = false;
+
+        if ($c->bedSpawn !== null) {
+            $c->x = (float) $c->bedSpawn[0];
+            $c->y = (float) $c->bedSpawn[1];
+            $c->z = (float) $c->bedSpawn[2];
+        } else {
+            [$sx, $sy, $sz] = $this->world->spawnPoint();
+            $c->x = (float) $sx + 0.5;
+            $c->y = (float) $sy;
+            $c->z = (float) $sz + 0.5;
+        }
+
+        $c->health = 20.0;
+        $c->food = 20;
+        $c->saturation = 5.0;
+        $c->fallFrom = -1.0;
+        $c->portalDim = 0;
+        $c->sentChunks = [];
+        $c->chunkQueue = [];
+
+        $c->send(self::C_RESPAWN, (new Writer())
+            ->int(0)
+            ->byte(1)
+            ->byte($c->gamemode)
+            ->string('default'));
+        $c->send(self::C_POS_LOOK, (new Writer())
+            ->double($c->x)->double($c->y)->double($c->z)
+            ->float(0)->float(0)->byte(0));
+        $this->queueChunks($c);
+        $c->lastHealth = -1.0;
+        $this->sendHealth($c);
+        $this->sendPlayerInventory($c);
+        $this->sendCursor($c);
+
+        $this->log(sprintf('  %s 重生到 %.1f,%.1f,%.1f%s',
+            $c->username, $c->x, $c->y, $c->z,
+            $c->bedSpawn !== null ? '（床上）' : '（世界出生点）'));
     }
 
     private function sendChat(Connection $c, array $component, int $position = 1): void

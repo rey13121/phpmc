@@ -236,6 +236,15 @@ trait ChestTrait
         $partner = $this->findChestPartner($x, $y, $z);
         $size = 27;
         $slots = $this->chests->load($x, $y, $z);
+        // 旧图兼容：空箱子首次打开时按周围方块 roll 结构战利品
+        if ($this->chestSlotsEmpty($slots)) {
+            $pool = $this->guessLootPool($x, $y, $z);
+            if ($pool !== null) {
+                $slots = \PhpMc\World\LootTables::rollChest($pool);
+                $this->chests->save($x, $y, $z, $slots);
+                $this->log("  结构箱首次填充 {$pool} @ {$x},{$y},{$z}");
+            }
+        }
         if ($partner !== null) {
             $other = $this->chests->load($partner[0], $partner[1], $partner[2]);
             $size = 54;
