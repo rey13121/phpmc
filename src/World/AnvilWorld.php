@@ -309,8 +309,9 @@ final class AnvilWorld
             $pool = 'dungeon';
             $hasRail = false;
             $hasLavaOrFurnace = false;
-            for ($dx = -3; $dx <= 3; $dx++) {
-                for ($dz = -3; $dz <= 3; $dz++) {
+            $hasStronghold = false;
+            for ($dx = -4; $dx <= 4; $dx++) {
+                for ($dz = -4; $dz <= 4; $dz++) {
                     for ($dy = -1; $dy <= 2; $dy++) {
                         $nx = $x + $dx;
                         $ny = $y + $dy;
@@ -328,11 +329,16 @@ final class AnvilWorld
                         if ($id === 10 || $id === 11 || $id === 61 || $id === 62 || $id === 145) {
                             $hasLavaOrFurnace = true;
                         }
+                        if ($id === 120 || $id === 98) {
+                            $hasStronghold = true;
+                        }
                     }
                 }
             }
             if ($hasRail) {
                 $pool = 'mineshaft';
+            } elseif ($hasStronghold && $y < 50) {
+                $pool = 'stronghold';
             } elseif ($hasLavaOrFurnace) {
                 $pool = 'blacksmith';
             } elseif ($y >= 56) {

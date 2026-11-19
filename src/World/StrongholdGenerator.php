@@ -4,65 +4,101 @@ declare(strict_types=1);
 namespace PhpMc\World;
 
 /**
- * 简化要塞：地下石砖房间 + 末地门框架圈（未激活）。
- * 不是原版多房间迷宫，仅提供可探索的末地门结构雏形。
+ * 简化要塞：门厅 + 走廊 + 末地门房间（12 框架正确朝向）+ 银鱼刷怪笼。
  */
 final class StrongholdGenerator
 {
-    /** 每 48 区块网格尝试一次 */
     public static function tryGenerate(int $seed, int $cx, int $cz, callable $get, callable $set): void
     {
         $rand = new JavaRandom($seed ^ ($cx * 341873128712) ^ ($cz * 132897987541) ^ 10387313);
-        // 稀疏
         if ((($cx % 48 + 48) % 48) !== $rand->nextIntBound(48)) {
             return;
         }
         if ((($cz % 48 + 48) % 48) !== $rand->nextIntBound(48)) {
             return;
         }
-        if ($rand->nextIntBound(5) !== 0) {
+        if ($rand->nextIntBound(4) !== 0) {
             return;
         }
 
-        $y = 25 + $rand->nextIntBound(15);
-        // 外框房间 11x11
-        for ($dx = 0; $dx < 11; $dx++) {
-            for ($dz = 0; $dz < 11; $dz++) {
-                for ($dy = 0; $dy < 7; $dy++) {
-                    $x = $dx;
-                    $z = $dz;
-                    if ($x > 15 || $z > 15) {
+        $y = 22 + $rand->nextIntBound(18);
+
+        // 主厅 11×11
+        self::box($set, 0, $y, 0, 10, 6, 10, 98, 0);
+        self::hollow($set, 1, $y + 1, 1, 9, 5, 9);
+        // 门洞朝 -Z
+        $set(5, $y + 1, 0, 0, 0);
+        $set(5, $y + 2, 0, 0, 0);
+
+        // 走廊向 +X
+        self::box($set, 10, $y, 3, 15, 5, 7, 98, 0);
+        self::hollow($set, 10, $y + 1, 4, 15, 4, 6);
+
+        // 末地门房（走廊尽头，仍在本区块内用 10-15）
+        // 门框架相对坐标：中心约 (12, 5)
+        $fy = $y + 1;
+        // 12 框、无四角；meta: 方向 | 0（未嵌眼）
+        // 北 z=3 朝南(0)；南 z=7 朝北(2)；西 x=10 朝东(3)；东 x=14 朝西(1)
+        foreach ([11, 12, 13] as $x) {
+            $set($x, $fy, 3, 120, 0);
+            $set($x, $fy, 7, 120, 2);
+        }
+        foreach ([4, 5, 6] as $z) {
+            $set(10, $fy, $z, 120, 3);
+            $set(14, $fy, $z, 120, 1);
+        }
+        // 门内空气
+        for ($x = 11; $x <= 13; $x++) {
+            for ($z = 4; $z <= 6; $z++) {
+                $set($x, $fy, $z, 0, 0);
+            }
+        }
+
+        // 银鱼刷怪笼
+        $set(5, $y + 1, 5, 52, 0);
+
+        // 箱子 ×2
+        $set(2, $y + 1, 2, 54, 0);
+        $set(8, $y + 1, 8, 54, 0);
+
+        // 书架墙
+        for ($dy = 1; $dy <= 3; $dy++) {
+            $set(1, $y + $dy, 8, 47, 0);
+            $set(1, $y + $dy, 9, 47, 0);
+        }
+
+        // 石砖楼梯装饰
+        $set(5, $y + 1, 9, 109, 3);
+    }
+
+    private static function box(callable $set, int $x0, int $y0, int $z0, int $x1, int $y1, int $z1, int $id, int $meta): void
+    {
+        for ($x = $x0; $x <= $x1; $x++) {
+            for ($y = $y0; $y <= $y1; $y++) {
+                for ($z = $z0; $z <= $z1; $z++) {
+                    if ($x > 15 || $z > 15 || $y < 0 || $y > 255) {
                         continue;
                     }
-                    $edge = ($dx === 0 || $dx === 10 || $dz === 0 || $dz === 10 || $dy === 0 || $dy === 6);
+                    $edge = ($x === $x0 || $x === $x1 || $y === $y0 || $y === $y1 || $z === $z0 || $z === $z1);
                     if ($edge) {
-                        $set($x, $y + $dy, $z, 98, 0); // 石砖
-                    } else {
-                        $set($x, $y + $dy, $z, 0, 0);
+                        $set($x, $y, $z, $id, $meta);
                     }
                 }
             }
         }
-        // 门洞
-        $set(5, $y + 1, 0, 0, 0);
-        $set(5, $y + 2, 0, 0, 0);
+    }
 
-        // 末地门框架 5x5 开口向上（方块 120）
-        $fx = 3;
-        $fz = 3;
-        $fy = $y + 1;
-        for ($i = 0; $i < 5; $i++) {
-            $set($fx + $i, $fy, $fz, 120, 0);
-            $set($fx + $i, $fy, $fz + 4, 120, 0);
-            $set($fx, $fy, $fz + $i, 120, 0);
-            $set($fx + 4, $fy, $fz + $i, 120, 0);
+    private static function hollow(callable $set, int $x0, int $y0, int $z0, int $x1, int $y1, int $z1): void
+    {
+        for ($x = $x0; $x <= $x1; $x++) {
+            for ($y = $y0; $y <= $y1; $y++) {
+                for ($z = $z0; $z <= $z1; $z++) {
+                    if ($x > 15 || $z > 15) {
+                        continue;
+                    }
+                    $set($x, $y, $z, 0, 0);
+                }
+            }
         }
-        // 中央一格箱子
-        $set(5, $y + 1, 5, 54, 0);
-        // 书架装饰
-        $set(1, $y + 1, 1, 47, 0);
-        $set(1, $y + 2, 1, 47, 0);
-        $set(9, $y + 1, 9, 47, 0);
-        $set(9, $y + 2, 9, 47, 0);
     }
 }

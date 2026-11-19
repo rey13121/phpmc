@@ -3065,6 +3065,16 @@ final class Server
                     ->int((int) ($c->z * 32))
                     ->byte(self::angle($c->yaw))->byte(0)->bool(true));
             }
+        } elseif ($moved && $c->riding > 0 && isset($this->mobs[$c->riding])) {
+            // 骑马：马跟着玩家
+            $hid = $c->riding;
+            $this->mobs[$hid]['x'] = $c->x;
+            $this->mobs[$hid]['y'] = $c->y;
+            $this->mobs[$hid]['z'] = $c->z;
+            $this->mobs[$hid]['yaw'] = $c->yaw;
+            if (method_exists($this, 'broadcastMobTeleport')) {
+                $this->broadcastMobTeleport($hid);
+            }
         }
 
         // 跑动和跳跃的饱食度消耗（原版：跑 0.1/格，跳 0.05，冲刺跳 0.2）
@@ -5801,6 +5811,67 @@ final class Server
             $this->sendInventorySlot($c, 36 + $c->heldSlot, $c->inventory[36 + $c->heldSlot] ?? null);
             $this->sendChat($c, ['text' => '苦力怕被充能了！', 'color' => 'yellow'], 1);
             $this->log("  {$c->username} 充能苦力怕 eid={$eid}");
+            return;
+        }
+
+        // 骨头驯服狼
+        if ($type === 95 && $hid === 352 && empty($m['tamed'])) {
+            $held['count'] = (int) $held['count'] - 1;
+            if ($held['count'] <= 0) {
+                unset($c->inventory[36 + $c->heldSlot]);
+            } else {
+                $c->inventory[36 + $c->heldSlot] = $held;
+            }
+            $this->sendInventorySlot($c, 36 + $c->heldSlot, $c->inventory[36 + $c->heldSlot] ?? null);
+            if (random_int(1, 3) === 1) {
+                $m['tamed'] = true;
+                $m['owner'] = $c->username;
+                $m['hostile'] = false;
+                $m['sitting'] = false;
+                foreach ($this->players() as $pp) {
+                    $pp->send(self::C_ENTITY_STATUS, (new Writer())->int($eid)->byte(6)); // 驯服成功心
+                }
+                $this->sendChat($c, ['text' => '狼被驯服了！右键切换坐下', 'color' => 'green'], 1);
+                $this->log("  {$c->username} 驯服狼 eid={$eid}");
+            } else {
+                foreach ($this->players() as $pp) {
+                    $pp->send(self::C_ENTITY_STATUS, (new Writer())->int($eid)->byte(6));
+                }
+            }
+            return;
+        }
+        // 已驯服狼：空手右键坐下/起来
+        if ($type === 95 && !empty($m['tamed']) && ($m['owner'] ?? '') === $c->username && $hid === 0) {
+            $m['sitting'] = empty($m['sitting']);
+            $this->sendChat($c, ['text' => !empty($m['sitting']) ? '狼坐下了' : '狼跟你走了', 'color' => 'gray'], 1);
+            return;
+        }
+        // 马 + 鞍：骑乘
+        if ($type === 100 && $hid === 329) {
+            $held['count'] = (int) $held['count'] - 1;
+            if ($held['count'] <= 0) {
+                unset($c->inventory[36 + $c->heldSlot]);
+            } else {
+                $c->inventory[36 + $c->heldSlot] = $held;
+            }
+            $this->sendInventorySlot($c, 36 + $c->heldSlot, $c->inventory[36 + $c->heldSlot] ?? null);
+            $m['saddled'] = true;
+            $c->riding = $eid;
+            foreach ($this->players() as $pp) {
+                $pp->send(self::C_ATTACH_ENTITY, (new Writer())
+                    ->int($c->entityId)->int($eid)->byte(0));
+            }
+            $this->sendChat($c, ['text' => '上马！潜行下马', 'color' => 'green'], 1);
+            $this->log("  {$c->username} 骑上马 eid={$eid}");
+            return;
+        }
+        // 已装鞍的马：空手也可骑
+        if ($type === 100 && !empty($m['saddled']) && ($hid === 0 || $hid === 329)) {
+            $c->riding = $eid;
+            foreach ($this->players() as $pp) {
+                $pp->send(self::C_ATTACH_ENTITY, (new Writer())
+                    ->int($c->entityId)->int($eid)->byte(0));
+            }
             return;
         }
 

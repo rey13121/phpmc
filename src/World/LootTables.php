@@ -79,6 +79,26 @@ final class LootTables
         [287, 1, 4, 5],    // 线
     ];
 
+    /** 要塞箱子 */
+    private const STRONGHOLD = [
+        [264, 1, 3, 3],    // 钻石
+        [266, 1, 3, 5],    // 金锭
+        [265, 1, 5, 10],   // 铁锭
+        [297, 1, 3, 15],   // 面包
+        [296, 1, 4, 10],   // 小麦
+        [331, 1, 4, 10],   // 红石
+        [348, 1, 3, 8],    // 荧石粉
+        [381, 1, 1, 10],   // 末影之眼
+        [368, 1, 1, 10],   // 末影珍珠
+        [340, 1, 3, 10],   // 书
+        [47, 1, 2, 5],     // 书架
+        [322, 1, 1, 2],    // 金苹果
+        [267, 1, 1, 5],    // 铁剑
+        [257, 1, 1, 5],    // 铁镐
+        [345, 1, 1, 5],    // 指南针
+        [403, 1, 1, 3],    // 附魔书（简化无 NBT）
+    ];
+
     /** 村庄房屋箱子（若以后接入） */
     private const VILLAGE = [
         [296, 1, 3, 10],
@@ -92,7 +112,7 @@ final class LootTables
 
     /**
      * 生成 27 格箱子内容。
-     * @param 'dungeon'|'mineshaft'|'village'|'blacksmith' $pool
+     * @param 'dungeon'|'mineshaft'|'village'|'blacksmith'|'stronghold' $pool
      * @return array<int, array{id:int,count:int,damage:int}|null>
      */
     public static function rollChest(string $pool, ?int $seed = null): array
@@ -101,6 +121,7 @@ final class LootTables
             'mineshaft' => self::MINESHAFT,
             'village' => self::VILLAGE,
             'blacksmith' => self::BLACKSMITH,
+            'stronghold' => self::STRONGHOLD,
             default => self::DUNGEON,
         };
 
@@ -109,6 +130,7 @@ final class LootTables
             'mineshaft' => random_int(3, 8),
             'village' => random_int(2, 5),
             'blacksmith' => random_int(3, 8),
+            'stronghold' => random_int(4, 9),
             default => random_int(3, 7),
         };
 

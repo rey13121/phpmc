@@ -26,8 +26,9 @@ trait MobTrait
         51  => ['skeleton',  true,  20, [[352, 0, 2], [262, 0, 2]],    0.20, 0, 16.0, 2.0],
         52  => ['spider',    true,  16, [[287, 0, 2], [375, 0, 1]],    0.24, 2,  2.5, 1.2],
         54  => ['zombie',    true,  20, [[367, 0, 2]],                 0.19, 3,  2.2, 1.5],
-        57  => ['pigman',    true,  20, [[371, 0, 1], [370, 0, 1]],    0.22, 5,  2.2, 1.2],
+        57  => ['pigman',    false, 20, [[371, 0, 1], [370, 0, 1]],    0.22, 5,  2.2, 1.2],
         58  => ['enderman',  true,  40, [[368, 0, 1]],                 0.26, 7,  2.5, 1.0],
+        60  => ['silverfish',true,  8,  [],                            0.28, 1,  1.5, 1.0],
         65  => ['bat',       false,  6, [],                            0.25, 0,  0.0, 0.0],
         90  => ['pig',       false, 10, [[319, 1, 3]],                 0.16, 0,  0.0, 0.0],
         91  => ['sheep',     false,  8, [[423, 1, 2], [35, 1, 1]],     0.15, 0,  0.0, 0.0],
@@ -157,11 +158,37 @@ trait MobTrait
             }
         }
 
+        // 猪人：挨打后群体敌对
+        if ((int) $this->mobs[$eid]['type'] === 57) {
+            $this->angerPigmenNear($this->mobs[$eid]['x'], $this->mobs[$eid]['z'], 32.0);
+        }
+        // 狼：被打后敌对；已驯服则对攻击主人者敌对
+        if ((int) $this->mobs[$eid]['type'] === 95 && empty($this->mobs[$eid]['tamed'])) {
+            $this->mobs[$eid]['hostile'] = true;
+            $this->mobs[$eid]['target'] = $attacker->entityId;
+        }
+
         if ($this->mobs[$eid]['hp'] <= 0) {
             $this->killMob($eid, $attacker);
         }
 
         return true;
+    }
+
+    private function angerPigmenNear(float $x, float $z, float $radius): void
+    {
+        $r2 = $radius * $radius;
+        foreach ($this->mobs as $id => $m) {
+            if ((int) ($m['type'] ?? 0) !== 57 || !empty($m['dead'])) {
+                continue;
+            }
+            $dx = $m['x'] - $x;
+            $dz = $m['z'] - $z;
+            if ($dx * $dx + $dz * $dz <= $r2) {
+                $this->mobs[$id]['hostile'] = true;
+                $this->mobs[$id]['angerUntil'] = microtime(true) + 40.0;
+            }
+        }
     }
 
     private function killMob(int $eid, ?Connection $killer): void
@@ -274,6 +301,75 @@ trait MobTrait
             $atkRange = (float) $def[6];
             $atkCd = (float) $def[7];
             $isHostile = !empty($m['hostile']);
+
+            // 猪人怒气消退
+            if ($type === 57 && !empty($m['angerUntil']) && $now >= $m['angerUntil']) {
+                $this->mobs[$eid]['hostile'] = false;
+                $this->mobs[$eid]['angerUntil'] = 0.0;
+                $isHostile = false;
+            }
+
+            // 末影人对视激怒（玩家视线对准、距离 < 64、未戴南瓜）
+            if ($type === 58 && !$isHostile) {
+                foreach ($this->players() as $pp) {
+                    if ($pp->gamemode === 1 || $pp->gamemode === 3 || $pp->portalDim !== ($m['dim'] ?? 0)) {
+                        // portalDim may not be on mob - skip dim check if unset
+                    }
+                    if ($pp->gamemode === 1 || $pp->gamemode === 3) {
+                        continue;
+                    }
+                    $helm = $pp->inventory[5] ?? null;
+                    if (is_array($helm) && (int) $helm['id'] === 86) { // 南瓜
+                        continue;
+                    }
+                    $d = $this->mobDistTo($m, $pp);
+                    if ($d > 64.0 || $d < 1.0) {
+                        continue;
+                    }
+                    // 玩家朝向是否看向末影人眼部
+                    $dx = $m['x'] - $pp->x;
+                    $dy = ($m['y'] + 1.6) - ($pp->y + 1.6);
+                    $dz = $m['z'] - $pp->z;
+                    $len = sqrt($dx * $dx + $dy * $dy + $dz * $dz) ?: 1.0;
+                    $dx /= $len; $dy /= $len; $dz /= $len;
+                    $yaw = deg2rad($pp->yaw);
+                    $pitch = deg2rad($pp->pitch);
+                    $lx = -sin($yaw) * cos($pitch);
+                    $ly = -sin($pitch);
+                    $lz = cos($yaw) * cos($pitch);
+                    $dot = $dx * $lx + $dy * $ly + $dz * $lz;
+                    if ($dot > 0.96) { // 约 16° 锥
+                        $this->mobs[$eid]['hostile'] = true;
+                        $this->mobs[$eid]['target'] = $pp->entityId;
+                        $this->mobs[$eid]['angryUntil'] = $now + 30.0;
+                        $isHostile = true;
+                        break;
+                    }
+                }
+            }
+
+            // 驯服狼跟随主人
+            if ($type === 95 && !empty($m['tamed']) && !empty($m['owner'])) {
+                foreach ($this->players() as $pp) {
+                    if (strtolower($pp->username) !== strtolower((string) $m['owner'])) {
+                        continue;
+                    }
+                    $d = $this->mobDistTo($m, $pp);
+                    if ($d > 3.0 && $d < 40.0 && empty($m['sitting'])) {
+                        [$nx, $nz, $moved] = $this->mobStepToward($m, $pp->x, $pp->z, $speed * 1.2);
+                        if ($moved) {
+                            $gy = $this->mobResolveHeight($m, $nx, $nz);
+                            if ($gy !== null) {
+                                $this->mobs[$eid]['x'] = $nx;
+                                $this->mobs[$eid]['y'] = $gy;
+                                $this->mobs[$eid]['z'] = $nz;
+                                $this->broadcastMobTeleport($eid);
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
 
             $near = null;
             $bestD = PHP_FLOAT_MAX;
@@ -506,9 +602,15 @@ trait MobTrait
             [-$dz, $dx],
             [$dz, -$dx],
         ];
+        $spd = $speed;
+        $feetId = $this->world->chunk((int) floor($m['x']) >> 4, (int) floor($m['z']) >> 4)
+            ->blockState((int) floor($m['x']) & 15, (int) floor($m['y']), (int) floor($m['z']) & 15) >> 4;
+        if ($feetId === 8 || $feetId === 9) {
+            $spd *= 0.45; // 水中减速（过水）
+        }
         foreach ($candidates as [$cx, $cz]) {
-            $nx = $m['x'] + $cx * $speed;
-            $nz = $m['z'] + $cz * $speed;
+            $nx = $m['x'] + $cx * $spd;
+            $nz = $m['z'] + $cz * $spd;
             if ($this->mobResolveHeight($m, $nx, $nz) !== null) {
                 return [$nx, $nz, true];
             }
