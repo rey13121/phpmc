@@ -823,6 +823,10 @@ final class Server
             $this->log("  补发地上掉落物 {$resent} 个");
         }
         $this->log("  载入背包 " . count($c->inventory) . ' 格');
+        // 进服同步天气
+        $c->send(self::C_CHANGE_GAME_STATE, (new Writer())
+            ->unsignedByte($this->raining ? 2 : 1)->float(0.0));
+
 
         // 4) 标签列表 / 互相看见
         // 给新玩家 c 的 Spawn 要延后到 1 秒后（见 resendPeersAt）：
@@ -2295,6 +2299,10 @@ final class Server
                         $this->log("  {$c->username} 上船 eid={$targetEid}");
                         break;
                     }
+                    // 对生物：喂食繁殖 / 打火石点苦力怕
+                    if (isset($this->mobs[$targetEid])) {
+                        $this->interactMob($c, $targetEid);
+                    }
                     break;
                 }
                 if ($action === 1) {          // 1 = 攻击
@@ -3463,6 +3471,13 @@ final class Server
     /** 死亡是否保留背包（/gamerule keepInventory） */
     private bool $keepInventory = false;
 
+    /** 是否推进昼夜（/gamerule doDaylightCycle） */
+    private bool $doDaylightCycle = true;
+
+    /** 天气：是否下雨、下次切换的时刻 */
+    private bool $raining = false;
+    private float $weatherUntil = 0.0;
+
     private array $xpStore = [];
     private bool $xpLoaded = false;
 
@@ -4498,10 +4513,41 @@ final class Server
                     ], 1);
                     break;
                 }
+                if ($rule === 'dodaylightcycle') {
+                    if ($val === 'true' || $val === '1') {
+                        $this->doDaylightCycle = true;
+                        $this->world->setDaylightCycle(true);
+                    } elseif ($val === 'false' || $val === '0') {
+                        $this->doDaylightCycle = false;
+                        $this->world->setDaylightCycle(false);
+                    }
+                    $this->sendChat($c, [
+                        'text' => 'gamerule doDaylightCycle = ' . ($this->doDaylightCycle ? 'true' : 'false'),
+                        'color' => 'green',
+                    ], 1);
+                    break;
+                }
                 $this->sendChat($c, [
-                    'text' => '用法：/gamerule keepInventory <true|false> 或 naturalRegeneration <true|false>',
+                    'text' => '用法：/gamerule keepInventory|naturalRegeneration|doDaylightCycle <true|false>',
                     'color' => 'yellow',
                 ], 1);
+                break;
+
+            case 'weather':
+                $w = strtolower(trim((string) ($args[0] ?? '')));
+                $sec = (int) ($args[1] ?? 600);
+                if ($sec < 1) {
+                    $sec = 600;
+                }
+                if ($w === 'clear' || $w === 'sun') {
+                    $this->setWeather(false, $sec);
+                    $this->sendChat($c, ['text' => "天气：晴（{$sec}s）", 'color' => 'aqua'], 1);
+                } elseif ($w === 'rain' || $w === 'thunder') {
+                    $this->setWeather(true, $sec);
+                    $this->sendChat($c, ['text' => "天气：雨（{$sec}s）", 'color' => 'aqua'], 1);
+                } else {
+                    $this->sendChat($c, ['text' => '用法：/weather <clear|rain> [秒]', 'color' => 'yellow'], 1);
+                }
                 break;
 
             case 'timeset':
@@ -5730,6 +5776,102 @@ final class Server
      * 玩家死亡：掉落背包、发 0 血量（客户端死亡界面）、等 Client Status 重生。
      * 不再立刻 0x07 重生（那会跳过死亡画面）。
      */
+
+    /** 右键生物：打火石充能苦力怕；小麦/种子/胡萝卜繁殖 */
+    private function interactMob(Connection $c, int $eid): void
+    {
+        if (!isset($this->mobs[$eid]) || !empty($this->mobs[$eid]['dead'])) {
+            return;
+        }
+        $m = &$this->mobs[$eid];
+        $type = (int) $m['type'];
+        $held = $c->inventory[36 + $c->heldSlot] ?? null;
+        $hid = is_array($held) ? (int) $held['id'] : 0;
+
+        // 打火石点苦力怕 → 充能（下次爆炸威力更大）
+        if ($type === 50 && $hid === 259) {
+            $m['charged'] = true;
+            // 扣打火石耐久
+            $held['damage'] = (int) ($held['damage'] ?? 0) + 1;
+            if ($held['damage'] >= 64) {
+                unset($c->inventory[36 + $c->heldSlot]);
+            } else {
+                $c->inventory[36 + $c->heldSlot] = $held;
+            }
+            $this->sendInventorySlot($c, 36 + $c->heldSlot, $c->inventory[36 + $c->heldSlot] ?? null);
+            $this->sendChat($c, ['text' => '苦力怕被充能了！', 'color' => 'yellow'], 1);
+            $this->log("  {$c->username} 充能苦力怕 eid={$eid}");
+            return;
+        }
+
+        // 繁殖食物
+        $foodOk = match ($type) {
+            90 => $hid === 391,              // 猪：胡萝卜
+            91, 92, 96 => $hid === 296,      // 羊/牛/蘑菇牛：小麦
+            93 => in_array($hid, [295, 361, 362], true), // 鸡：种子
+            101 => $hid === 391,             // 兔：胡萝卜
+            95 => in_array($hid, [363, 364, 319, 320], true), // 狼：肉（简化驯/爱）
+            default => false,
+        };
+        if (!$foodOk) {
+            return;
+        }
+        // 扣一个食物
+        $held['count'] = (int) $held['count'] - 1;
+        if ($held['count'] <= 0) {
+            unset($c->inventory[36 + $c->heldSlot]);
+        } else {
+            $c->inventory[36 + $c->heldSlot] = $held;
+        }
+        $this->sendInventorySlot($c, 36 + $c->heldSlot, $c->inventory[36 + $c->heldSlot] ?? null);
+
+        $m['inLoveUntil'] = microtime(true) + 30.0;
+        // 红心：Entity Status 18
+        foreach ($this->players() as $pp) {
+            $pp->send(self::C_ENTITY_STATUS, (new Writer())->int($eid)->byte(18));
+        }
+        $this->tryBreed($eid, $type);
+        $this->log("  {$c->username} 喂食 type={$type} eid={$eid}");
+    }
+
+    private function tryBreed(int $eid, int $type): void
+    {
+        if (!isset($this->mobs[$eid])) {
+            return;
+        }
+        $a = $this->mobs[$eid];
+        $now = microtime(true);
+        if (($a['inLoveUntil'] ?? 0) < $now) {
+            return;
+        }
+        foreach ($this->mobs as $oid => $b) {
+            if ($oid === $eid || (int) ($b['type'] ?? 0) !== $type) {
+                continue;
+            }
+            if (!empty($b['dead']) || ($b['inLoveUntil'] ?? 0) < $now) {
+                continue;
+            }
+            $dx = $a['x'] - $b['x'];
+            $dz = $a['z'] - $b['z'];
+            if ($dx * $dx + $dz * $dz > 64) {
+                continue;
+            }
+            // 生成幼体（简化：同种、较小血量标记 baby）
+            $mx = ($a['x'] + $b['x']) / 2;
+            $mz = ($a['z'] + $b['z']) / 2;
+            $my = max($a['y'], $b['y']);
+            $this->mobs[$eid]['inLoveUntil'] = 0;
+            $this->mobs[$oid]['inLoveUntil'] = 0;
+            $baby = $this->spawnMob($type, $mx, $my, $mz);
+            if ($baby > 0 && isset($this->mobs[$baby])) {
+                $this->mobs[$baby]['baby'] = true;
+                $this->mobs[$baby]['hp'] = max(1, (int) floor(($this->mobs[$baby]['hp'] ?? 10) / 2));
+            }
+            $this->log("  繁殖 type={$type} 幼体 eid={$baby}");
+            return;
+        }
+    }
+
     private function killPlayer(Connection $c): void
     {
         if ($c->dead) {
@@ -5828,6 +5970,36 @@ final class Server
         $this->log(sprintf('  %s 重生到 %.1f,%.1f,%.1f%s',
             $c->username, $c->x, $c->y, $c->z,
             $c->bedSpawn !== null ? '（床上）' : '（世界出生点）'));
+    }
+
+
+    private function setWeather(bool $rain, int $seconds): void
+    {
+        $this->raining = $rain;
+        $this->weatherUntil = microtime(true) + max(1, $seconds);
+        $reason = $rain ? 2 : 1; // 1.8: 1 end rain, 2 begin rain
+        $pkt = (new Writer())->unsignedByte($reason)->float(0.0);
+        foreach ($this->players() as $p) {
+            $p->send(self::C_CHANGE_GAME_STATE, $pkt);
+        }
+        $this->log('  天气 -> ' . ($rain ? '雨' : '晴') . " ({$seconds}s)");
+    }
+
+    private function tickWeather(float $now): void
+    {
+        if ($this->weatherUntil <= 0.0) {
+            // 首次：随机一段时间后下雨
+            $this->weatherUntil = $now + random_int(300, 900);
+            return;
+        }
+        if ($now < $this->weatherUntil) {
+            return;
+        }
+        if ($this->raining) {
+            $this->setWeather(false, random_int(300, 1200));
+        } else {
+            $this->setWeather(true, random_int(120, 480));
+        }
     }
 
     private function sendChat(Connection $c, array $component, int $position = 1): void
@@ -6118,6 +6290,8 @@ final class Server
                 $this->log('  全员睡觉，跳到天亮');
             }
         }
+
+        $this->tickWeather($now);
 
         // 每秒同步一次时间，客户端天空才会真的昼→夜
         if ($now - $this->lastTimeSync >= 1.0) {

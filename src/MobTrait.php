@@ -178,8 +178,13 @@ trait MobTrait
         $this->mobs[$eid]['dead'] = true;
         $this->mobs[$eid]['deadAt'] = microtime(true) + 1.0;
         $owner = $killer;
+        $looting = 0;
+        if ($killer !== null) {
+            $wpn = $killer->inventory[36 + $killer->heldSlot] ?? null;
+            $looting = $this->itemEnchLevel($wpn, 21); // Looting
+        }
         foreach ($drops as [$dId, $dMin, $dMax]) {
-            $cnt = random_int($dMin, $dMax);
+            $cnt = random_int($dMin, max($dMin, $dMax + $looting));
             for ($q = 0; $q < $cnt; $q++) {
                 $this->spawnDrop(
                     (int) floor($m['x']), (int) floor($m['y']), (int) floor($m['z']),
@@ -187,8 +192,19 @@ trait MobTrait
                 );
             }
         }
+        // 稀有掉落
+        if ($type === 54) {
+            if (random_int(1, 100) <= 2 + $looting * 2) {
+                $this->spawnDrop((int) floor($m['x']), (int) floor($m['y']), (int) floor($m['z']), 391, 1, 0, $owner);
+            }
+            if (random_int(1, 100) <= 2 + $looting * 2) {
+                $this->spawnDrop((int) floor($m['x']), (int) floor($m['y']), (int) floor($m['z']), 265, 1, 0, $owner);
+            }
+        } elseif ($type === 51 && random_int(1, 100) <= 2 + $looting) {
+            $this->spawnDrop((int) floor($m['x']), (int) floor($m['y']), (int) floor($m['z']), 261, 1, 0, $owner);
+        }
         if ($killer !== null) {
-            $xp = self::MOB_TYPES[$type][1] ? 5 : random_int(1, 3);
+            $xp = self::MOB_TYPES[$type][1] ? 5 + $looting : random_int(1, 3);
             $this->giveExp($killer, $xp);
         }
     }
@@ -596,7 +612,7 @@ trait MobTrait
         $cx = $m['x'];
         $cy = $m['y'];
         $cz = $m['z'];
-        $power = 3.0;
+        $power = !empty($m['charged']) ? 6.0 : 3.0;
 
         foreach ($this->players() as $p) {
             $p->send(self::C_EXPLOSION, (new Writer())
@@ -617,7 +633,7 @@ trait MobTrait
             }
         }
 
-        $r = 2;
+        $r = !empty($m['charged']) ? 4 : 2;
         $ix = (int) floor($cx);
         $iy = (int) floor($cy);
         $iz = (int) floor($cz);

@@ -384,6 +384,7 @@ final class TerrainGenerator
         // ---------------- 地牢 / 废弃矿道（简化） ----------------
         DungeonGenerator::tryGenerate($this->seed, $cx, $cz, $get, $set);
         MineshaftGenerator::tryGenerate($this->seed, $cx, $cz, $get, $set);
+        StrongholdGenerator::tryGenerate($this->seed, $cx, $cz, $get, $set);
 
         // ---------------- 树 ----------------
         // 每个群系用自己的树种、高度和密度（原来是所有群系统一 5 棵橡树）

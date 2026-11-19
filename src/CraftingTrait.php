@@ -269,14 +269,36 @@ trait CraftingTrait
             return $out;
         }
 
-        // 3) 地图复制：已写地图(358) + 空地图(395) → 两张已写地图（简化：输出一张 358）
-        // 原版会复制数据；这里至少不拦截合成
+        // 3) 地图复制：已写地图(358) + 空地图(395)
         if ($n === 2) {
             $ids = [(int) $items[0]['id'], (int) $items[1]['id']];
             sort($ids);
             if ($ids === [358, 395]) {
                 return ['id' => 358, 'count' => 2, 'damage' => (int) (($items[0]['id'] === 358 ? $items[0] : $items[1])['damage'] ?? 0)];
             }
+        }
+
+        // 4) 烟花火箭（简化）：1 纸 + 1～3 火药 [+ 可选染料]
+        $paper = 0;
+        $gun = 0;
+        $dye = 0;
+        $onlyOk = true;
+        foreach ($items as $it) {
+            $id = (int) $it['id'];
+            $c = (int) ($it['count'] ?? 1);
+            if ($id === 339) {
+                $paper += $c;
+            } elseif ($id === 289) {
+                $gun += $c;
+            } elseif ($id === 351) {
+                $dye += $c;
+            } else {
+                $onlyOk = false;
+            }
+        }
+        // 格子里通常每格 count=1，按格数算
+        if ($onlyOk && $paper >= 1 && $gun >= 1 && $n <= 5) {
+            return ['id' => 401, 'count' => 3, 'damage' => 0]; // 烟花火箭
         }
 
         return null;

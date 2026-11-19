@@ -1046,6 +1046,8 @@ final class AnvilWorld
      * 从 0 点开始，客户端靠 0x03 Time Update 跟着走。
      */
     private ?int $timeOffset = null;
+    private bool $timeFrozen = false;
+    private int $frozenTimeOfDay = 0;
 
     /** 世界种子（level.dat 的 RandomSeed） */
     /** 区块的 16x16 群系（不触发生成） */
@@ -1106,10 +1108,26 @@ final class AnvilWorld
 
     public function timeOfDay(): int
     {
+        if ($this->timeFrozen) {
+            return $this->frozenTimeOfDay;
+        }
         $v = (int) fmod(microtime(true) * 20, 24000.0) + ($this->timeOffset ?? 0);
         $v %= 24000;
 
         return $v < 0 ? $v + 24000 : $v;
+    }
+
+    public function setDaylightCycle(bool $on): void
+    {
+        if (!$on) {
+            $this->frozenTimeOfDay = $this->timeOfDay();
+            $this->timeFrozen = true;
+        } else {
+            if ($this->timeFrozen) {
+                $this->setTimeOfDay($this->frozenTimeOfDay);
+            }
+            $this->timeFrozen = false;
+        }
     }
 
     /** 直接把时间拨到某个 tick（/timeset 用）。 */
@@ -1117,6 +1135,9 @@ final class AnvilWorld
     {
         $t = (($t % 24000) + 24000) % 24000;
         $this->timeOffset = $t - (int) fmod(microtime(true) * 20, 24000.0);
+        if ($this->timeFrozen) {
+            $this->frozenTimeOfDay = $t;
+        }
     }
 
     /** 世界总 tick 数（Time Update 里第一个 long）。 */
