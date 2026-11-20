@@ -212,9 +212,10 @@ trait BrewingTrait
         }
         $k = $c->brewing['x'] . ',' . $c->brewing['y'] . ',' . $c->brewing['z'];
         $b = $this->brews[$k] ?? ['brew' => 0, 'fuel' => 0];
-        // 0 = 已酿时长，1 = 燃料
-        $c->send(self::C_WINDOW_PROPERTY, (new Writer())->byte(5)->short(0)->short(min(400, (int) $b['brew'])));
-        $c->send(self::C_WINDOW_PROPERTY, (new Writer())->byte(5)->short(1)->short((int) $b['fuel']));
+        // 1.8 客户端：属性 0 = 剩余酿造时间（400→0），属性 1 = 燃料（1.9+ 才有，可发 0）
+        $brewed = min(400, max(0, (int) ($b['brew'] ?? 0)));
+        $c->send(self::C_WINDOW_PROPERTY, (new Writer())->byte(5)->short(0)->short(400 - $brewed));
+        $c->send(self::C_WINDOW_PROPERTY, (new Writer())->byte(5)->short(1)->short(20));
     }
 
     private function clickBrewing(Connection $c, int $slot, int $button, int $mode, ?array $cursor): void
@@ -285,82 +286,89 @@ trait BrewingTrait
     /** 每 2 秒推进一次酿造进度 */
     private function tickBrewing(float $now): void
     {
-        if ($now - $this->lastBrewTick < 2.0) {
+        // 约每 0.5s 推进一次，保证进度条与完成可感知
+        if ($now - $this->lastBrewTick < 0.5) {
             return;
         }
-        $elapsed = $now - ($this->lastBrewTick ?: $now);
+        $elapsed = $now - ($this->lastBrewTick > 0 ? $this->lastBrewTick : $now);
         $this->lastBrewTick = $now;
         $this->loadBrews();
         if ($this->brews === []) {
             return;
         }
-        $ticks = (int) round($elapsed * 20);
+        // 1.8.9 酿造台没有烈焰粉燃料槽；燃料条件会导致「有动画/在转但永远不出货」
+        $ticks = max(1, (int) round($elapsed * 20));
+        $anyChanged = false;
 
         foreach ($this->brews as $k => &$b) {
-            $ing = $b['slots'][3] ?? null;
-
-            // 1.8：烈焰粉不是独立槽位，它放在材料格（槽 3）里当燃料。
-            // 材料格是烈焰粉且没燃料时，先充 20 次。
-            if ($ing !== null && (int) $ing['id'] === 377 && (int) $b['fuel'] <= 0) {
-                $b['fuel'] = 20;
-                $b['slots'][3] = ((int) $ing['count'] > 1)
-                    ? ['id' => 377, 'count' => (int) $ing['count'] - 1, 'damage' => 0]
-                    : null;
-                $ing = $b['slots'][3] ?? null;
+            if (!isset($b['slots']) || !is_array($b['slots'])) {
+                $b['slots'] = [null, null, null, null];
             }
-            // 注意：烈焰粉既可作燃料也可作力量材料；燃料已在上方处理，
-            // 这里不再无条件跳过 377，否则永远酿不出力量药水。
-            if ($ing === null
-                || !in_array((int) $ing['id'], self::BREW_INGREDIENTS, true)
-                || (int) $b['fuel'] <= 0) {
+            $ing = $b['slots'][3] ?? null;
+            if ($ing === null || !is_array($ing)) {
+                $b['brew'] = 0;
                 continue;
             }
-            // 三个槽里至少要有一个水瓶
-            $any = false;
+            $ingId = (int) $ing['id'];
+            if (!in_array($ingId, self::BREW_INGREDIENTS, true)) {
+                $b['brew'] = 0;
+                continue;
+            }
+
+            // 至少一瓶可被该材料转化的药水
+            $canWork = false;
             for ($i = 0; $i < 3; $i++) {
                 $it = $b['slots'][$i] ?? null;
-                if (is_array($it) && (int) $it['id'] === 373) {
-                    $any = true;
+                if (!is_array($it) || (int) $it['id'] !== 373) {
+                    continue;
+                }
+                if ($this->brewTransform($ingId, (int) ($it['damage'] ?? 0)) !== null) {
+                    $canWork = true;
                     break;
                 }
             }
-            if (!$any) {
+            if (!$canWork) {
+                $b['brew'] = 0;
                 continue;
             }
-            if ($b['fuel'] <= 0) {
-                $fuel = $b['slots'][4] ?? null;
-                if (is_array($fuel) && (int) $fuel['id'] === 377) {   // 烈焰粉
-                    $b['fuel'] = 20;
-                    $b['slots'][4] = ((int) $fuel['count'] > 1)
-                        ? ['id' => 377, 'count' => (int) $fuel['count'] - 1, 'damage' => 0]
-                        : null;
-                } else {
-                    continue;
-                }
+
+            $b['brew'] = (int) ($b['brew'] ?? 0) + $ticks;
+            $anyChanged = true;
+            if ($b['brew'] < 400) {
+                continue;
             }
 
-            $b['brew'] = (int) $b['brew'] + $ticks;
-            if ($b['brew'] >= 400) {
-                $b['brew'] = 0;
-                $b['fuel'] = max(0, (int) $b['fuel'] - 1);
-                for ($i = 0; $i < 3; $i++) {
-                    $it = $b['slots'][$i] ?? null;
-                    if (is_array($it) && (int) $it['id'] === 373) {
-                        $outDamage = $this->brewTransform((int) $ing['id'], (int) ($it['damage'] ?? 0));
-                        if ($outDamage === null) {
-                            continue;
-                        }
-                        $b['slots'][$i] = ['id' => 373, 'count' => (int) $it['count'], 'damage' => $outDamage];
-                    }
+            // 完成：转化药水并消耗 1 个材料（仅当至少一瓶成功）
+            $b['brew'] = 0;
+            $converted = 0;
+            for ($i = 0; $i < 3; $i++) {
+                $it = $b['slots'][$i] ?? null;
+                if (!is_array($it) || (int) $it['id'] !== 373) {
+                    continue;
                 }
-                $b['slots'][3] = ((int) $ing['count'] > 1)
-                    ? ['id' => $ing['id'], 'count' => (int) $ing['count'] - 1, 'damage' => (int) ($ing['damage'] ?? 0)]
+                $outDamage = $this->brewTransform($ingId, (int) ($it['damage'] ?? 0));
+                if ($outDamage === null) {
+                    continue;
+                }
+                $b['slots'][$i] = [
+                    'id' => 373,
+                    'count' => max(1, (int) ($it['count'] ?? 1)),
+                    'damage' => $outDamage,
+                ];
+                $converted++;
+            }
+            if ($converted > 0) {
+                $cnt = (int) ($ing['count'] ?? 1) - 1;
+                $b['slots'][3] = $cnt > 0
+                    ? ['id' => $ingId, 'count' => $cnt, 'damage' => (int) ($ing['damage'] ?? 0)]
                     : null;
+                $this->log(sprintf('  酿造完成 @ %s 材料=%d 转化%d瓶', $k, $ingId, $converted));
             }
         }
         unset($b);
         $this->saveBrews();
 
+        // 有人开着酿造台就刷新窗口（进度 + 结果）
         foreach ($this->players() as $p) {
             if ($p->brewing !== null) {
                 $this->sendBrewWindow($p);

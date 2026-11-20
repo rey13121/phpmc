@@ -209,7 +209,9 @@ trait RedstoneTrait
             }
         }
 
+        // 没有红石粉时也要处理「拉杆直接贴门/火把」的情况
         if ($wires === []) {
+            $this->applyRedstoneConsumersAround($x, $y, $z);
             $this->redstoneBusy = false;
 
             return;
@@ -291,9 +293,10 @@ trait RedstoneTrait
                 $id = $state >> 4;
                 $meta = $state & 0x0F;
 
-                // 火把：旁边有电就灭
+                // 火把：旁边有电（导线或拉杆等）就灭
                 if ($id === 75 || $id === 76) {
-                    $powered = $this->maxNeighborWirePower($nx, $ny, $nz) > 0;
+                    $powered = $this->maxNeighborWirePower($nx, $ny, $nz) > 0
+                        || $this->simpleRedstoneSourcePowerAdjacent($nx, $ny, $nz) > 0;
                     $wantId = $powered ? 75 : 76;
                     if ($wantId !== $id) {
                         $this->changeBlock($nx, $ny, $nz, $wantId, $meta);
@@ -303,7 +306,8 @@ trait RedstoneTrait
 
                 // 门：有电就开（0x4），上下两格同步
                 if ($id === 64 || $id === 71) {
-                    $powered = $this->maxNeighborWirePower($nx, $ny, $nz) > 0;
+                    $powered = $this->maxNeighborWirePower($nx, $ny, $nz) > 0
+                        || $this->simpleRedstoneSourcePowerAdjacent($nx, $ny, $nz) > 0;
                     $lower = ($meta & 0x8) !== 0 ? $ny - 1 : $ny;
                     if ($lower < 0) {
                         continue;
@@ -324,4 +328,20 @@ trait RedstoneTrait
             }
         }
     }
+
+    /** 无红石粉时，以某点为中心检查相邻受电器 */
+    private function applyRedstoneConsumersAround(int $x, int $y, int $z): void
+    {
+        $this->applyRedstoneConsumers([$x . ',' . $y . ',' . $z => [$x, $y, $z]]);
+    }
+
+    private function simpleRedstoneSourcePowerAdjacent(int $x, int $y, int $z): int
+    {
+        $best = 0;
+        foreach ([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]] as [$dx, $dy, $dz]) {
+            $best = max($best, $this->simpleRedstoneSourcePower($x + $dx, $y + $dy, $z + $dz));
+        }
+        return $best;
+    }
+
 }

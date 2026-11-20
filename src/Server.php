@@ -2600,7 +2600,10 @@ final class Server
         }
         $chunk = $this->world->chunk($x >> 4, $z >> 4);
         $existing = $chunk->blockState($x & 15, $y, $z & 15);
-        if ($id !== 0 && $existing !== 0 && !self::isReplaceable($existing >> 4)) {
+        // 同一方块改 meta（拉杆/按钮开关、门开关、中继器）必须放行，
+        // 否则会「看起来点了、服务端状态不变 → 红石完全无效」。
+        $sameTypeUpdate = ($id !== 0 && $existing !== 0 && ($existing >> 4) === $id);
+        if ($id !== 0 && $existing !== 0 && !self::isReplaceable($existing >> 4) && !$sameTypeUpdate) {
             // 客户端已经先把方块画上去了。这里必须把服务端的真实方块打回去，
             // 否则客户端会一直留一块幽灵方块，右键它只会继续发放置包。
             $this->broadcastBlockChange($x, $y, $z, $existing);
@@ -2917,6 +2920,8 @@ final class Server
                 $this->inNeighborUpdate = false;
             }
         }
+        // 红石粉/拉杆/火把被挖掉后也要重算连通网络
+        $this->updateRedstoneAround($x, $y, $z);
 
         // 创造模式不掉落（原版行为）
         if ($c->gamemode === 1) {
@@ -3184,6 +3189,9 @@ final class Server
 
     /** 物品 id => 方块 id（1.8 里这几样物品 id 与方块 id 不同） */
     private const PLACEABLE_ITEM = [
+        331 => 55,   // 红石粉 -> 红石线
+        356 => 93,   // 中继器 -> 未锁定中继器
+        404 => 149,  // 比较器（1.8 物品）
         323 => 63,   // 告示牌
         324 => 64,   // 橡木门
         427 => 193,  // 云杉门
