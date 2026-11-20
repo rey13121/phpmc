@@ -3488,6 +3488,9 @@ final class Server
     private bool $raining = false;
     private float $weatherUntil = 0.0;
 
+    /** 0 和平 1 简单 2 普通 3 困难 */
+    private int $difficulty = 2;
+
     private array $xpStore = [];
     private bool $xpLoaded = false;
 
@@ -4038,6 +4041,11 @@ final class Server
                 $this->sendChat($c, ['text' => '/reload  丢掉内存缓存、按磁盘重发（验证存盘）', 'color' => 'gray'], 1);
                 $this->sendChat($c, ['text' => '/clear  清空背包（含盔甲与合成格）', 'color' => 'gray'], 1);
                 $this->sendChat($c, ['text' => '/give <id> [数量] [损伤值]  给物品', 'color' => 'gray'], 1);
+                $this->sendChat($c, ['text' => '/summon <生物名> [x y z]  生成生物', 'color' => 'gray'], 1);
+                $this->sendChat($c, ['text' => '/xp <点数|级数L>  增减经验', 'color' => 'gray'], 1);
+                $this->sendChat($c, ['text' => '/difficulty 0-3  和平~困难', 'color' => 'gray'], 1);
+                $this->sendChat($c, ['text' => '/effect clear|heal|speed  简化效果', 'color' => 'gray'], 1);
+                $this->sendChat($c, ['text' => '/weather /gamerule /timeset  见对应用法', 'color' => 'gray'], 1);
                 break;
 
             case 'gm':
@@ -4637,7 +4645,6 @@ final class Server
                 $this->sendChat($c, ['text' => '在线：' . implode(', ', $names), 'color' => 'yellow'], 1);
                 break;
 
-            default:
             case 'clear':
                 $c->inventory = [];
                 $c->craftGrid = [null, null, null, null];
@@ -4664,7 +4671,109 @@ final class Server
                 $this->log("  {$c->username} /give {$id} x{$count}");
                 break;
 
+            case 'summon':
+                $name = strtolower(trim((string) ($parts[0] ?? '')));
+                $map = [
+                    'creeper' => 50, 'skeleton' => 51, 'spider' => 52, 'zombie' => 54,
+                    'pigman' => 57, 'zombie_pigman' => 57, 'enderman' => 58,
+                    'silverfish' => 60, 'bat' => 65, 'pig' => 90, 'sheep' => 91,
+                    'cow' => 92, 'chicken' => 93, 'wolf' => 95, 'mooshroom' => 96,
+                    'ocelot' => 98, 'cat' => 98, 'horse' => 100, 'rabbit' => 101,
+                ];
+                if ($name === '' || !isset($map[$name])) {
+                    $this->sendChat($c, [
+                        'text' => '用法：/summon <creeper|zombie|pig|cow|wolf|horse|...> [x y z]',
+                        'color' => 'yellow',
+                    ], 1);
+                    break;
+                }
+                $sx = isset($parts[1]) ? (float) $parts[1] : $c->x;
+                $sy = isset($parts[2]) ? (float) $parts[2] : $c->y;
+                $sz = isset($parts[3]) ? (float) $parts[3] : $c->z;
+                $eid = $this->spawnMob($map[$name], $sx, $sy, $sz);
+                if ($eid <= 0) {
+                    $this->sendChat($c, ['text' => '生成失败', 'color' => 'red'], 1);
+                    break;
+                }
+                $this->sendChat($c, ['text' => "已生成 {$name} (eid={$eid})", 'color' => 'green'], 1);
+                $this->log("  {$c->username} /summon {$name}");
+                break;
+
+            case 'xp':
+            case 'experience':
+                $amt = (int) ($parts[0] ?? 0);
+                if ($amt === 0 && !isset($parts[0])) {
+                    $this->sendChat($c, ['text' => '用法：/xp <点数>  或 /xp <级数>L', 'color' => 'yellow'], 1);
+                    break;
+                }
+                $raw = (string) ($parts[0] ?? '0');
+                if (str_ends_with(strtolower($raw), 'l')) {
+                    $levels = (int) $raw;
+                    // 粗略：每级按当前曲线给经验
+                    $amt = 0;
+                    for ($i = 0; $i < abs($levels); $i++) {
+                        $lv = $c->xpLevel + ($levels > 0 ? $i : -$i - 1);
+                        $amt += $lv <= 16 ? 17 : ($lv <= 31 ? 37 : 62);
+                    }
+                    if ($levels < 0) {
+                        $amt = -min($c->xpTotal, $amt);
+                    }
+                }
+                if ($amt > 0) {
+                    $this->giveExp($c, $amt);
+                } elseif ($amt < 0) {
+                    $c->xpTotal = max(0, $c->xpTotal + $amt);
+                    $this->giveExp($c, 0); // recalc via zero path won't work
+                    // force recalc
+                    $this->recalcXpFromTotal($c);
+                }
+                $this->sendChat($c, [
+                    'text' => "经验：等级 {$c->xpLevel}，总计 {$c->xpTotal}",
+                    'color' => 'green',
+                ], 1);
+                break;
+
+            case 'difficulty':
+            case 'diff':
+                $d = (int) ($parts[0] ?? -1);
+                if ($d < 0 || $d > 3) {
+                    $this->sendChat($c, [
+                        'text' => '用法：/difficulty 0~3（和平/简单/普通/困难）当前=' . $this->difficulty,
+                        'color' => 'yellow',
+                    ], 1);
+                    break;
+                }
+                $this->difficulty = $d;
+                $names = ['和平', '简单', '普通', '困难'];
+                $this->sendChat($c, ['text' => '难度：' . $names[$d], 'color' => 'green'], 1);
+                $this->log("  {$c->username} /difficulty {$d}");
+                break;
+
+            case 'effect':
+                // 简化：/effect clear | /effect heal | /effect speed
+                $what = strtolower(trim((string) ($parts[0] ?? '')));
+                if ($what === 'clear' || $what === '') {
+                    $c->effectSpeedUntil = 0.0;
+                    $this->sendChat($c, ['text' => '效果已清除（简化）', 'color' => 'gray'], 1);
+                    break;
+                }
+                if ($what === 'heal' || $what === 'healing') {
+                    $c->health = 20.0;
+                    $this->syncVitals($c, true);
+                    $this->sendChat($c, ['text' => '已回满血', 'color' => 'green'], 1);
+                    break;
+                }
+                if ($what === 'speed') {
+                    $c->effectSpeedUntil = microtime(true) + 60.0;
+                    $this->sendChat($c, ['text' => '速度 60 秒（简化，略加快移动同步）', 'color' => 'green'], 1);
+                    break;
+                }
+                $this->sendChat($c, ['text' => '用法：/effect clear|heal|speed', 'color' => 'yellow'], 1);
+                break;
+
+            default:
                 $this->sendChat($c, ['text' => "未知命令 /{$cmd}，试试 /help", 'color' => 'red'], 1);
+                break;
         }
     }
 
@@ -5725,6 +5834,36 @@ final class Server
      * 加经验。1.8 的等级曲线：0-15 级每级 17 点，16-30 每级 37 点，之后每级 62 点。
      * 直接按总经验换算等级，不用维护「当前级攒了多少」。
      */
+    private function recalcXpFromTotal(Connection $c): void
+    {
+        $total = max(0, $c->xpTotal);
+        $level = 0;
+        if ($total < 17 * 16) {
+            $level = intdiv($total, 17);
+        } elseif ($total < 17 * 16 + 37 * 15) {
+            $level = 16 + intdiv($total - 17 * 16, 37);
+        } else {
+            $level = 31 + intdiv($total - (17 * 16 + 37 * 15), 62);
+        }
+        if ($level <= 16) {
+            $base = $level * 17;
+            $need = 17;
+        } elseif ($level <= 31) {
+            $base = 17 * 16 + ($level - 16) * 37;
+            $need = 37;
+        } else {
+            $base = 17 * 16 + 37 * 15 + ($level - 31) * 62;
+            $need = 62;
+        }
+        $c->xpLevel = $level;
+        $c->xpProgress = $need > 0 ? min(1.0, ($total - $base) / $need) : 0.0;
+        $this->loadXpStore();
+        $this->xpStore[strtolower($c->username)] = $total;
+        $this->saveXpStore();
+        $c->send(self::C_SET_EXPERIENCE, (new Writer())
+            ->float($c->xpProgress)->varInt($c->xpLevel)->varInt($c->xpTotal));
+    }
+
     private function giveExp(Connection $c, int $amount): void
     {
         if ($amount <= 0) {
@@ -5901,6 +6040,27 @@ final class Server
             $this->sendInventorySlot($c, 36 + $c->heldSlot, $c->inventory[36 + $c->heldSlot] ?? null);
             $this->sendChat($c, ['text' => '苦力怕被充能了！', 'color' => 'yellow'], 1);
             $this->log("  {$c->username} 充能苦力怕 eid={$eid}");
+            return;
+        }
+
+        // 生鱼驯服豹猫
+        if ($type === 98 && in_array($hid, [349, 350], true) && empty($m['tamed'])) {
+            $held['count'] = (int) $held['count'] - 1;
+            if ($held['count'] <= 0) {
+                unset($c->inventory[36 + $c->heldSlot]);
+            } else {
+                $c->inventory[36 + $c->heldSlot] = $held;
+            }
+            $this->sendInventorySlot($c, 36 + $c->heldSlot, $c->inventory[36 + $c->heldSlot] ?? null);
+            if (random_int(1, 3) === 1) {
+                $m['tamed'] = true;
+                $m['owner'] = $c->username;
+                $m['sitting'] = false;
+                foreach ($this->players() as $pp) {
+                    $pp->send(self::C_ENTITY_STATUS, (new Writer())->int($eid)->byte(6));
+                }
+                $this->sendChat($c, ['text' => '豹猫被驯服了！', 'color' => 'green'], 1);
+            }
             return;
         }
 
@@ -6089,13 +6249,27 @@ final class Server
             $this->sendCursor($c);
         }
 
-        // 经验：死亡清空进度（简化，不生成经验球）
+        // 经验：约一半掉成经验球，其余清空
+        $dropXp = (int) floor($c->xpTotal * 0.5);
         $c->xpLevel = 0;
         $c->xpProgress = 0.0;
         $c->xpTotal = 0;
         $this->xpStore[strtolower($c->username)] = 0;
         $c->send(self::C_SET_EXPERIENCE, (new Writer())
             ->float(0.0)->varInt(0)->varInt(0));
+        if ($dropXp > 0 && $c->gamemode !== 1) {
+            $left = $dropXp;
+            while ($left > 0) {
+                $v = min(11, $left);
+                $left -= $v;
+                $this->spawnXpOrb(
+                    $c->x + random_int(-5, 5) / 10.0,
+                    $c->y + 0.5,
+                    $c->z + random_int(-5, 5) / 10.0,
+                    $v
+                );
+            }
+        }
 
         $c->lastHealth = -1.0;
         $this->syncVitals($c, true);   // health=0 → 客户端死亡界面

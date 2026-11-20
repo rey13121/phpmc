@@ -191,6 +191,22 @@ trait MobTrait
         }
     }
 
+    /** 难度影响怪物伤害：和平 0、简单 ×0.5、普通 ×1、困难 ×1.5 */
+    private function scaleMobDamage(int $dmg): int
+    {
+        $diff = $this->difficulty ?? 2;
+        if ($diff <= 0) {
+            return 0;
+        }
+        if ($diff === 1) {
+            return max(1, (int) floor($dmg * 0.5));
+        }
+        if ($diff >= 3) {
+            return max(1, (int) round($dmg * 1.5));
+        }
+        return $dmg;
+    }
+
     private function killMob(int $eid, ?Connection $killer): void
     {
         if (!isset($this->mobs[$eid]) || !empty($this->mobs[$eid]['dead'])) {
@@ -300,7 +316,7 @@ trait MobTrait
             $meleeDmg = (int) $def[5];
             $atkRange = (float) $def[6];
             $atkCd = (float) $def[7];
-            $isHostile = !empty($m['hostile']);
+            $isHostile = !empty($m['hostile']) && (($this->difficulty ?? 2) > 0);
 
             // 猪人怒气消退
             if ($type === 57 && !empty($m['angerUntil']) && $now >= $m['angerUntil']) {
@@ -349,8 +365,8 @@ trait MobTrait
                 }
             }
 
-            // 驯服狼跟随主人
-            if ($type === 95 && !empty($m['tamed']) && !empty($m['owner'])) {
+            // 驯服狼/猫跟随主人
+            if (($type === 95 || $type === 98) && !empty($m['tamed']) && !empty($m['owner'])) {
                 foreach ($this->players() as $pp) {
                     if (strtolower($pp->username) !== strtolower((string) $m['owner'])) {
                         continue;
@@ -501,7 +517,7 @@ trait MobTrait
                         }
                     }
                     if ($bestD <= $atkRange && $now - ($m['lastAttack'] ?? 0) >= $atkCd) {
-                        $this->damage($near, max(1, $meleeDmg));
+                        $this->damage($near, $this->scaleMobDamage(max(1, $meleeDmg)));
                         $this->mobs[$eid]['lastAttack'] = $now;
                     }
                 } else {
@@ -509,7 +525,7 @@ trait MobTrait
                         [$nx, $nz, $moved] = $this->mobStepToward($m, $near->x, $near->z, $speed);
                     }
                     if ($bestD <= $atkRange && $now - ($m['lastAttack'] ?? 0) >= $atkCd) {
-                        $this->damage($near, max(1, $meleeDmg));
+                        $this->damage($near, $this->scaleMobDamage(max(1, $meleeDmg)));
                         $this->mobs[$eid]['lastAttack'] = $now;
                     }
                 }
@@ -732,7 +748,7 @@ trait MobTrait
             $d = sqrt(($p->x - $cx) ** 2 + ($p->y - $cy) ** 2 + ($p->z - $cz) ** 2);
             if ($d < $power + 2) {
                 $dmg = (int) max(1, round((1.0 - $d / ($power + 2)) * 18));
-                $this->damage($p, $dmg, 'explosion');
+                $this->damage($p, $this->scaleMobDamage($dmg), 'explosion');
             }
         }
 
