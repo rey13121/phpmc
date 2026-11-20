@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.8.1 — 2026-11-20
+
+- **协议修复**：Client Status (0x16) 误调 `Reader::varInt()`，改为 `readVarInt()`，修复进服即断开
+
 ## v0.8.0 — 2026-11-20
 
 - **严重**：修复未知命令误落入 `/clear` 清空背包的 bug

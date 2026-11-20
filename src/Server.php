@@ -2550,7 +2550,7 @@ final class Server
                 break;
 
             case 0x16: // Client Status：0=重生 1=请求统计 2=开物品栏成就
-                $action = $r->varInt();
+                $action = $r->readVarInt();
                 if ($action === 0) {
                     $this->respawnPlayer($c);
                 }
