@@ -6,7 +6,7 @@
 - **零扩展依赖**（不需要 sockets / 特殊 pecl）
 - 直接读写 Anvil 存档（`.mca`）
 
-当前版本见根目录 [`VERSION`](VERSION)。变更见 [`CHANGELOG.md`](CHANGELOG.md)，规划见 [`ROADMAP.md`](ROADMAP.md)。
+**当前正式版：v1.0.0**（见根目录 [`VERSION`](VERSION)）。变更见 [`CHANGELOG.md`](CHANGELOG.md)，规划见 [`ROADMAP.md`](ROADMAP.md)。
 
 ---
 
